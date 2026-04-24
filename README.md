@@ -830,4 +830,3 @@ This README is synchronized with the uploaded `log_clean.py` DAG version `2.0`.
 - filesystem safety emphasis
 - audit/reporting focus
 - Ruff and mypy-oriented quality posture
-# airflow_log_cleanup
