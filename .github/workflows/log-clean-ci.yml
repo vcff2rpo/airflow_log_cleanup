@@ -1,0 +1,575 @@
+name: log-clean-ci
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - "release/**"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Run CI first, then release-and-pr"
+        required: false
+        type: boolean
+        default: false
+      release_version:
+        description: "Manual release version to validate, package, tag, release, and PR, for example 2.08"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: log-clean-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.publish_release || 'false' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ruff-format:
+    name: ruff-format
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/release/'))) || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.13-slim
+    steps:
+      - name: Install git
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+      - name: Check out repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_root="$(pwd -P)"
+          git init .
+          git config --global --add safe.directory "$repo_root"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+      - name: Install ruff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install ruff
+      - name: Verify formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m ruff format --check log_clean.py tests
+
+  ruff-lint:
+    name: ruff-lint
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/release/'))) || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    needs: ruff-format
+    container:
+      image: python:3.13-slim
+    steps:
+      - name: Install git
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+      - name: Check out repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_root="$(pwd -P)"
+          git init .
+          git config --global --add safe.directory "$repo_root"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+      - name: Install ruff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install ruff
+      - name: Run ruff lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m ruff check log_clean.py tests
+
+  mypy:
+    name: mypy
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/release/'))) || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    needs: ruff-lint
+    container:
+      image: python:3.13-slim
+    steps:
+      - name: Install git
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+      - name: Check out repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_root="$(pwd -P)"
+          git init .
+          git config --global --add safe.directory "$repo_root"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+      - name: Install typing toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install mypy pendulum pytest
+      - name: Run mypy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m mypy --python-version 3.11 log_clean.py tests
+
+  pytest-full:
+    name: pytest-full
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/release/'))) || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    needs: mypy
+    container:
+      image: python:3.13-slim
+    steps:
+      - name: Install git
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+      - name: Check out repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_root="$(pwd -P)"
+          git init .
+          git config --global --add safe.directory "$repo_root"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+      - name: Install pytest toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-cov
+      - name: Run full pytest suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests
+
+  smoke-test:
+    name: smoke-test (${{ matrix.python-version }})
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/release/'))) || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    needs: mypy
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13"]
+    container:
+      image: python:${{ matrix.python-version }}-slim
+    steps:
+      - name: Install git
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+      - name: Check out repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_root="$(pwd -P)"
+          git init .
+          git config --global --add safe.directory "$repo_root"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+      - name: Install smoke test toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-cov
+      - name: Run smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/test_log_clean_smoke.py             --cov=log_clean             --cov-report=term-missing
+
+  release-and-pr:
+    name: release-and-pr
+    needs:
+      - pytest-full
+      - smoke-test
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        env:
+          PRIMARY_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          token="${PRIMARY_TOKEN:-}"
+          if [[ -z "$token" ]]; then
+            token="${FALLBACK_TOKEN:-}"
+          fi
+          [[ -n "$token" ]] || { echo "ERROR: No usable GitHub token is available." >&2; exit 1; }
+          repo_root="$(pwd -P)"
+          git init .
+          git config --global --add safe.directory "$repo_root"
+          git config --global --add safe.directory "$PWD"
+          git remote add origin "https://x-access-token:${token}@github.com/${{ github.repository }}.git"
+          git fetch --prune --tags origin
+          git fetch origin "${{ github.ref_name }}"
+          git checkout -B "${{ github.ref_name }}" FETCH_HEAD
+
+      - name: Resolve release artifact source
+        id: version
+        env:
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+          import zipfile
+
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          ref_name = os.environ["GITHUB_REF_NAME"]
+          requested_version = os.environ.get("INPUT_RELEASE_VERSION", "").strip()
+
+          release_dir = pathlib.Path(".release")
+          release_dir.mkdir(exist_ok=True)
+
+          if event_name == "workflow_dispatch":
+              source = pathlib.Path("log_clean.py")
+              if not source.exists():
+                  sys.exit("log_clean.py not found for manual release packaging")
+
+              text = source.read_text(encoding="utf-8")
+              source_match = re.search(r'^__version__\s*=\s*"(?P<version>\d+\.\d{2})"', text, re.MULTILINE)
+              if not source_match:
+                  sys.exit('Missing __version__ = "X.YY" in log_clean.py')
+
+              source_version = source_match.group("version")
+              version = requested_version or source_version
+              if not re.fullmatch(r"\d+\.\d{2}", version):
+                  sys.exit(f"Invalid release version: {version!r}. Expected X.YY")
+              if requested_version and requested_version != source_version:
+                  sys.exit(
+                      "Release version mismatch: "
+                      f"log_clean.py __version__={source_version!r}, "
+                      f"workflow input release_version={requested_version!r}"
+                  )
+
+              filename = f"log_clean_v{version}.py"
+              updated_text, count = re.subn(
+                  r'^__version__\s*=\s*"\d+\.\d{2}"',
+                  f'__version__ = "{version}"',
+                  text,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  sys.exit("Unable to rewrite __version__ in release artifact")
+
+              versioned_py_path = release_dir / filename
+              versioned_py_path.write_text(updated_text, encoding="utf-8", newline="\n")
+          else:
+              changed_files = [line.strip() for line in os.popen("git diff --name-only origin/main...HEAD").read().splitlines() if line.strip()]
+              if len(changed_files) != 1:
+                  sys.exit(
+                      "Pushes to release/** must differ from main by exactly one file. "
+                      f"Found changed files: {changed_files!r}"
+                  )
+              rel_path = pathlib.Path(changed_files[0])
+              if rel_path.parent != pathlib.Path(".") or not re.fullmatch(r"log_clean_v\d+\.\d{2}\.py", rel_path.name):
+                  sys.exit(
+                      "Pushes to release/** must contain only one repository-root versioned DAG file "
+                      f"named like log_clean_vX.YY.py. Found: {rel_path.as_posix()}"
+                  )
+
+              versioned_py_path = pathlib.Path(rel_path.name)
+              filename = versioned_py_path.name
+              match = re.fullmatch(r"log_clean_v(?P<version>\d+\.\d{2})\.py", filename)
+              if not match:
+                  sys.exit(f"Release branch file name does not match expected pattern: {filename}")
+              version = match.group("version")
+              source_version = version
+
+          zip_filename = f"log_clean_v{version}.zip"
+          tag_name = f"log_clean_v{version}.py"
+          zip_path = release_dir / zip_filename
+
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              zf.write(versioned_py_path, arcname=filename)
+
+          output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as fh:
+              fh.write(f"source_version={source_version}\n")
+              fh.write(f"version={version}\n")
+              fh.write(f"filename={filename}\n")
+              fh.write(f"zip_filename={zip_filename}\n")
+              fh.write(f"versioned_py_path={versioned_py_path.as_posix()}\n")
+              fh.write(f"asset_path={zip_path.as_posix()}\n")
+              fh.write(f"tag_name={tag_name}\n")
+          PY
+
+      - name: Resolve existing release state
+        id: releasestate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags origin || true
+          if git rev-parse -q --verify "refs/tags/${{ steps.version.outputs.tag_name }}" >/dev/null; then
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if gh release view "${{ steps.version.outputs.tag_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Git tag if missing
+        id: tagpush
+        if: steps.releasestate.outputs.tag_exists != 'true'
+        env:
+          PRIMARY_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          token="${PRIMARY_TOKEN:-}"
+          if [[ -z "$token" ]]; then
+            token="${FALLBACK_TOKEN:-}"
+          fi
+          [[ -n "$token" ]] || { echo "ERROR: No usable GitHub token is available." >&2; exit 1; }
+
+          retry_git_push() {
+            local refspec="$1"
+            local attempt=1
+            local max_attempts=3
+            while true; do
+              if git push origin "$refspec"; then
+                return 0
+              fi
+              if [[ "$attempt" -ge "$max_attempts" ]]; then
+                return 1
+              fi
+              echo "WARNING: push failed for $refspec on attempt $attempt; retrying..." >&2
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${token}@github.com/${{ github.repository }}.git"
+          git tag "${{ steps.version.outputs.tag_name }}" "${{ github.sha }}"
+
+          if retry_git_push "refs/tags/${{ steps.version.outputs.tag_name }}"; then
+            echo "tag_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_ready=false" >> "$GITHUB_OUTPUT"
+            echo "WARNING: Tag push failed. Repository rules likely restrict tag creation for this token. Release creation will be skipped, but PR flow can continue."
+          fi
+
+      - name: Create or update GitHub Release with retry
+        if: steps.releasestate.outputs.tag_exists == 'true' || steps.tagpush.outputs.tag_ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag_name }}"
+          asset="${{ steps.version.outputs.asset_path }}"
+
+          retry_release_cmd() {
+            local attempt=1
+            local max_attempts=3
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if [[ "$attempt" -ge "$max_attempts" ]]; then
+                echo "ERROR: Release command failed after $attempt attempts: $*" >&2
+                return 1
+              fi
+              echo "WARNING: Release command failed on attempt $attempt; retrying..." >&2
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+          }
+
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            retry_release_cmd gh release upload "$tag" "$asset" --repo "${{ github.repository }}" --clobber
+          else
+            retry_release_cmd gh release create "$tag" "$asset" --repo "${{ github.repository }}" --title "$tag" --generate-notes
+          fi
+
+      - name: Note skipped release creation when tag creation is blocked
+        if: steps.releasestate.outputs.tag_exists != 'true' && steps.tagpush.outputs.tag_ready != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Skipping GitHub Release creation because repository rules blocked tag creation."
+
+      - name: Prepare main-based PR branch with versioned file only
+        id: prprep
+        env:
+          PRIMARY_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          token="${PRIMARY_TOKEN:-}"
+          if [[ -z "$token" ]]; then
+            token="${FALLBACK_TOKEN:-}"
+          fi
+          [[ -n "$token" ]] || { echo "ERROR: No usable GitHub token is available." >&2; exit 1; }
+
+          branch="release/${{ steps.version.outputs.tag_name }}"
+          git fetch origin main
+          git checkout -B "$branch" origin/main
+          cp "${{ steps.version.outputs.versioned_py_path }}" "${{ steps.version.outputs.filename }}"
+          git add "${{ steps.version.outputs.filename }}"
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${token}@github.com/${{ github.repository }}.git"
+          git commit -m "release: add ${{ steps.version.outputs.filename }}"
+
+          retry_branch_push() {
+            local remote_branch="$1"
+            local attempt=1
+            local max_attempts=3
+            while true; do
+              if git push --force-with-lease -u origin "HEAD:${remote_branch}"; then
+                return 0
+              fi
+              if [[ "$attempt" -ge "$max_attempts" ]]; then
+                echo "ERROR: Failed to push branch ${remote_branch} after $attempt attempts." >&2
+                return 1
+              fi
+              echo "WARNING: branch push failed for ${remote_branch} on attempt $attempt; retrying..." >&2
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+          }
+
+          retry_branch_push "$branch"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update PR to main with versioned file only
+        if: steps.prprep.outputs.has_changes == 'true'
+        env:
+          PRIMARY_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          token="${PRIMARY_TOKEN:-}"
+          if [[ -z "$token" ]]; then
+            token="${FALLBACK_TOKEN:-}"
+          fi
+          [[ -n "$token" ]] || { echo "ERROR: No usable GitHub token is available." >&2; exit 1; }
+          export GH_TOKEN="$token"
+
+          branch="release/${{ steps.version.outputs.tag_name }}"
+          title="release: add ${{ steps.version.outputs.filename }}"
+          body_file="$(mktemp)"
+          cat > "$body_file" <<'BODY'
+          Automated release PR created.
+
+          Included file:
+          - `${{ steps.version.outputs.filename }}`
+
+          Release asset:
+          - `${{ steps.version.outputs.zip_filename }}`
+
+          Source:
+          - `log_clean.py`
+          - source version `${{ steps.version.outputs.source_version }}`
+          - released version `${{ steps.version.outputs.version }}`
+
+          Release tag:
+          - `${{ steps.version.outputs.tag_name }}`
+          BODY
+
+          existing_pr_number="$(gh pr list             --repo "${{ github.repository }}"             --head "$branch"             --base main             --json number             --jq '.[0].number // empty')"
+
+          label_args=()
+          for label in automated-release release; do
+            found_label="$(gh label list --repo "${{ github.repository }}" --search "$label" --json name --jq ".[] | select(.name == \"$label\") | .name" || true)"
+            if [[ "$found_label" == "$label" ]]; then
+              label_args+=(--label "$label")
+            fi
+          done
+
+          if [[ -n "$existing_pr_number" ]]; then
+            gh pr edit "$existing_pr_number"               --repo "${{ github.repository }}"               --title "$title"               --body-file "$body_file"
+          else
+            gh pr create               --repo "${{ github.repository }}"               --base main               --head "$branch"               --title "$title"               --body-file "$body_file"               "${label_args[@]}"
+          fi
+
+      - name: No-op when versioned file already matches main
+        if: steps.prprep.outputs.has_changes != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Versioned file already matches main; no PR update required."
