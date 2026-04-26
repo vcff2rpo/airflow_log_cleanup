@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -32,6 +32,10 @@ class DummyConf:
         return cls.values.get((section, key), fallback)
 
 
+class AirflowSkipException(Exception):
+    """Small stand-in for airflow.exceptions.AirflowSkipException."""
+
+
 class DummyDAG:
     """Minimal context-manager compatible DAG stub."""
 
@@ -54,10 +58,26 @@ def airflow_stub_modules(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     def get_current_context() -> dict[str, Any]:
         return current_context
 
-    def task(func: Any) -> Any:
+    def task(
+        func: Callable[..., Any] | None = None,
+        **_task_kwargs: Any,
+    ) -> Callable[..., Any] | Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(inner_func: Callable[..., Any]) -> Callable[..., Any]:
+            return inner_func
+
+        if func is None:
+            return decorator
+
         return func
 
     airflow_module = types.ModuleType("airflow")
+    airflow_module_any = cast(Any, airflow_module)
+    airflow_module_any.__path__ = []
+
+    exceptions_module = types.ModuleType("airflow.exceptions")
+    exceptions_module_any = cast(Any, exceptions_module)
+    exceptions_module_any.AirflowSkipException = AirflowSkipException
+
     pendulum_module = types.ModuleType("pendulum")
     pendulum_module_any = cast(Any, pendulum_module)
     pendulum_module_any.datetime = lambda *args, **kwargs: {"args": args, "kwargs": kwargs}
@@ -73,15 +93,22 @@ def airflow_stub_modules(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     sdk_module_any.get_current_context = get_current_context
     sdk_module_any.task = task
 
+    sdk_exceptions_module = types.ModuleType("airflow.sdk.exceptions")
+    sdk_exceptions_module_any = cast(Any, sdk_exceptions_module)
+    sdk_exceptions_module_any.AirflowSkipException = AirflowSkipException
+
     monkeypatch.setitem(sys.modules, "airflow", airflow_module)
     monkeypatch.setitem(sys.modules, "pendulum", pendulum_module)
     monkeypatch.setitem(sys.modules, "airflow.configuration", configuration_module)
+    monkeypatch.setitem(sys.modules, "airflow.exceptions", exceptions_module)
     monkeypatch.setitem(sys.modules, "airflow.sdk", sdk_module)
+    monkeypatch.setitem(sys.modules, "airflow.sdk.exceptions", sdk_exceptions_module)
 
     return {
         "conf": DummyConf,
         "Variable": VariableStore,
         "current_context": current_context,
+        "AirflowSkipException": AirflowSkipException,
     }
 
 

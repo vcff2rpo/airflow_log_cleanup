@@ -81,7 +81,7 @@ SECTION_WIDTHS: dict[str, list[int]] = {
     "01": [10, 44, 22, 36, 72],
     "02": [10, 44, 22, 36, 72],
     "04": [10, 18, 34, 110],
-    "05": [36, 18, 12, 90],
+    "05": [36, 18, 12, 55],
     "06": [40, 26],
     "07": [40, 26],
     "99": [24, 100],
@@ -508,7 +508,16 @@ def _parse_target_name_list(raw_value: str | None, *, field_name: str) -> tuple[
 
 
 def _sort_directories_deepest_first(paths: list[str]) -> list[str]:
-    return sorted(paths, key=lambda item: (-len(Path(item).parts), -len(item), item))
+    return sorted(
+        paths,
+        key=lambda item: (
+            -len(Path(item).parts),
+            -len(item),
+            Path(item).name.casefold(),
+            Path(item).name,
+            item,
+        ),
+    )
 
 
 def _sort_file_candidates_shortest_first(candidates: list[FileCandidate]) -> list[FileCandidate]:
@@ -633,9 +642,9 @@ def _group_audit_records_by_reason(records: list[AuditRecord]) -> list[tuple[str
 
     Age-based regular-file records are ordered from oldest to youngest.
 
-    Empty-directory cleanup records are ordered deepest/longest path first for
-    both dry-run candidate reporting and real delete reporting, so child
-    directories are shown before parent directories.
+    Empty-directory cleanup records are ordered by deepest path first, then
+    longest path, then directory basename, so leaf directories are displayed
+    before parent directories with deterministic name ordering.
     """
 
     grouped: dict[str, list[AuditRecord]] = defaultdict(list)
@@ -657,6 +666,8 @@ def _group_audit_records_by_reason(records: list[AuditRecord]) -> list[tuple[str
                 key=lambda record: (
                     -len(Path(record.real_path).parts),
                     -len(record.real_path),
+                    Path(record.real_path).name.casefold(),
+                    Path(record.real_path).name,
                     record.real_path,
                     record.detail,
                 ),

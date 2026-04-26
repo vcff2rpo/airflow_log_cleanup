@@ -39,7 +39,7 @@ def force_same_device_stats(monkeypatch: pytest.MonkeyPatch, root: Path) -> None
 def test_module_smoke_imports_and_exposes_dag(import_log_clean: Any) -> None:
     module = import_log_clean
 
-    assert module.DAG_ID == "log_clean"
+    assert module.DAG_ID == "airflow_log_cleanup"
     assert module.SCHEDULE == "@daily"
     assert module.dag is not None
     assert callable(module.execute_cleanup)
@@ -62,19 +62,27 @@ def test_as_bool_normalizes_common_inputs(import_log_clean: Any, raw_value: Any,
     assert module._as_bool(raw_value) is expected
 
 
-@pytest.mark.parametrize("raw_value", [0, "0", 7, "12"])
-def test_coerce_non_negative_int_accepts_valid_values(import_log_clean: Any, raw_value: Any) -> None:
+@pytest.mark.parametrize("raw_value", [1, "1", 7, "12"])
+def test_coerce_positive_int_accepts_positive_values(import_log_clean: Any, raw_value: Any) -> None:
     module = import_log_clean
 
-    assert module._coerce_non_negative_int(raw_value, field_name="x") == int(raw_value)
+    assert module._coerce_positive_int(raw_value, field_name="x") == int(raw_value)
+
+
+@pytest.mark.parametrize("raw_value", [0, "0"])
+def test_coerce_positive_int_skips_zero_retention(import_log_clean: Any, raw_value: Any) -> None:
+    module = import_log_clean
+
+    with pytest.raises(module.AirflowSkipException):
+        module._coerce_positive_int(raw_value, field_name="x")
 
 
 @pytest.mark.parametrize("raw_value", [True, -1, "-3", "abc", None])
-def test_coerce_non_negative_int_rejects_invalid_values(import_log_clean: Any, raw_value: Any) -> None:
+def test_coerce_positive_int_rejects_invalid_values(import_log_clean: Any, raw_value: Any) -> None:
     module = import_log_clean
 
     with pytest.raises(ValueError):
-        module._coerce_non_negative_int(raw_value, field_name="x")
+        module._coerce_positive_int(raw_value, field_name="x")
 
 
 @pytest.mark.parametrize("path_value", ["relative/path", "/", "/tmp", "/var/log"])
@@ -245,7 +253,7 @@ def test_delete_files_removes_targets_and_reports_bytes(import_log_clean: Any, t
         size_bytes=int(stat_result.st_size),
     )
 
-    result = module._delete_files([candidate])
+    result = module._delete_files([candidate], report_root=str(tmp_path))
 
     assert result.deleted == 1
     assert result.deleted_bytes == 6
@@ -258,7 +266,7 @@ def test_delete_directories_removes_empty_targets(import_log_clean: Any, tmp_pat
     target = tmp_path / "empty"
     target.mkdir()
 
-    result = module._delete_directories([str(target)])
+    result = module._delete_directories([str(target)], report_root=str(tmp_path))
 
     assert result.deleted == 1
     assert not target.exists()
