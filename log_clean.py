@@ -52,7 +52,7 @@ from airflow.sdk import DAG, Variable, get_current_context, task
 
 LOGGER = logging.getLogger(__name__)
 
-__version__ = "2.09"
+__version__ = "2.10"
 
 DAG_ID = "airflow_log_cleanup"
 START_DATE = pendulum.datetime(2024, 1, 1, tz="Europe/Prague")
