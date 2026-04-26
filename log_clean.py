@@ -47,6 +47,7 @@ from typing import Any
 
 import pendulum
 from airflow.configuration import conf
+from airflow.exceptions import AirflowSkipException
 from airflow.sdk import DAG, Variable, get_current_context, task
 
 LOGGER = logging.getLogger(__name__)
@@ -236,7 +237,6 @@ class ScanStats:
     files_skipped_inaccessible: int = 0
     files_skipped_cross_device: int = 0
     files_skipped_non_regular: int = 0
-    duration_seconds: float = 0.0
 
 
 @dataclass
@@ -356,20 +356,30 @@ def _as_bool(value: Any) -> bool:
     return value if isinstance(value, bool) else str(value).strip().lower() == "true"
 
 
-def _coerce_non_negative_int(value: Any, *, field_name: str) -> int:
+def _coerce_positive_int(value: Any, *, field_name: str) -> int:
     """Coerce an Airflow Variable value into a strictly positive integer.
 
-    Retention set to zero is intentionally rejected because it makes nearly all
-    existing regular files eligible for cleanup immediately.
+    Retention set to zero is intentionally rejected by skipping the task because
+    it would make nearly all existing regular files eligible for cleanup.
+    Negative and malformed values remain hard configuration errors.
     """
+
     if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be a non-negative integer, got bool.")
+        raise ValueError(f"{field_name} must be a positive integer, got bool.")
+
     try:
         parsed = int(str(value).strip())
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be a non-negative integer, got {value!r}.") from exc
+        raise ValueError(f"{field_name} must be a positive integer, got {value!r}.") from exc
+
+    if parsed == 0:
+        message = f"{field_name}=0 is unsafe for log cleanup. Task processing skipped because retention must be greater than 0."
+        LOGGER.error("%s", message)
+        raise AirflowSkipException(message)
+
     if parsed < 0:
         raise ValueError(f"{field_name} must be > 0, got {parsed}.")
+
     return parsed
 
 
@@ -595,35 +605,20 @@ def _audit_detail_float(record: AuditRecord, key_name: str) -> float:
     return float("inf")
 
 
-def _audit_record_sort_key(record: AuditRecord) -> tuple[int, int, float, float, int, int, str, str]:
+def _audit_record_sort_key(record: AuditRecord) -> tuple[int, float, float, int, int, str, str]:
     """Return deterministic sort key for audit records inside one reason group.
 
-    Sort behavior:
-    - Regular age-threshold file records sort by item type, then age_days
-      descending, so the oldest files are shown first.
-    - Empty-directory action records sort deepest/longest path first for both
-      delete mode and dry-run candidate reporting. This mirrors safe directory
-      removal order, where leaf directories must be handled before parents.
-    - Other records sort by item type, timestamp, path depth, path length, path.
+    Regular age-threshold file records sort by item type, then ``age_days``
+    descending, so the oldest files are shown first. Other records sort by item
+    type, observed timestamp, path depth, path length, path, and detail.
+
+    Empty-directory cleanup records are sorted by
+    ``_group_audit_records_by_reason()`` because that ordering is reason-specific
+    and must apply to both dry-run candidates and real delete records.
     """
-
-    if record.item_type == "directory" and record.why == "deleted because directory was empty during cleanup phase":
-        path_depth = len(Path(record.real_path).parts)
-
-        return (
-            _audit_item_type_order(record.item_type),
-            0,
-            0.0,
-            -record.observed_epoch,
-            -path_depth,
-            -len(record.real_path),
-            record.real_path,
-            record.detail,
-        )
 
     return (
         _audit_item_type_order(record.item_type),
-        1,
         -_audit_detail_float(record, "age_days"),
         record.observed_epoch,
         len(Path(record.real_path).parts),
@@ -849,7 +844,7 @@ def _build_settings(params: dict[str, Any]) -> CleanupSettings:
         Variable.get(TARGET_DENY_LIST_VARIABLE_KEY, default=""),
         field_name=TARGET_DENY_LIST_VARIABLE_KEY,
     )
-    max_log_age_days = _coerce_non_negative_int(
+    max_log_age_days = _coerce_positive_int(
         Variable.get(MAX_LOG_AGE_VARIABLE_KEY, default="30"),
         field_name=MAX_LOG_AGE_VARIABLE_KEY,
     )
@@ -1571,12 +1566,20 @@ def _action_audit_title(settings: CleanupSettings) -> str:
     return "Deleted Items" if settings.effective_delete_mode == "delete" else "Candidate Items"
 
 
-def _action_outcome_rows(settings: CleanupSettings, totals: RunTotals) -> list[tuple[str, Any]]:
+def _action_outcome_rows(
+    settings: CleanupSettings,
+    totals: RunTotals,
+    *,
+    action_skipped_count: int,
+) -> list[tuple[str, Any]]:
+    """Return final delete/action outcome rows for operator-facing summary."""
+
     return [
         ("mode", settings.effective_delete_mode),
         ("files_deleted", totals.files_deleted),
         ("files_deleted_total_size", _human_bytes(totals.files_deleted_bytes)),
         ("empty_dirs_deleted", totals.empty_dirs_deleted),
+        ("action_skipped_items", action_skipped_count),
     ]
 
 
@@ -1681,8 +1684,8 @@ with DAG(
         if not _try_create_lock(lock_file):
             result = _locked_result(round(time.monotonic() - task_started, 3))
             _log_section("07", "Overall Outcome", [("status", result["status"]), ("roots_processed", result["roots_processed"]), ("duration_seconds", result["duration_seconds"])])
-            _log_audit_list("10", "Excluded Items", [])
-            _log_audit_list("11", "Action Skipped Items", [])
+            _log_audit_list("10", "Action Skipped Items", [])
+            _log_audit_list("11", "Excluded Items", [])
             _log_audit_list("12", _action_audit_title(settings), [])
             return result
 
@@ -1783,10 +1786,10 @@ with DAG(
 
             totals.duration_seconds = round(time.monotonic() - task_started, 3)
             _log_info_table("05", "Root Scan Summary", ["SummaryItem", "Value", "Decision", "EvaluationMethod"], _root_scan_summary_rows(totals))
-            _log_section("06", "Action Outcome Summary", _action_outcome_rows(settings, totals))
+            _log_section("06", "Action Outcome Summary", _action_outcome_rows(settings, totals, action_skipped_count=len(action_skipped_audit_records)))
             _log_section("07", "Overall Outcome", _overall_outcome_rows(totals))
-            _log_audit_list("10", "Excluded Items", excluded_audit_records)
-            _log_audit_list("11", "Action Skipped Items", action_skipped_audit_records)
+            _log_audit_list("10", "Action Skipped Items", action_skipped_audit_records)
+            _log_audit_list("11", "Excluded Items", excluded_audit_records)
             _log_audit_list("12", _action_audit_title(settings), action_audit_records)
             return _completed_result(totals)
         finally:
