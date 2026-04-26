@@ -1817,7 +1817,10 @@ with DAG(
             _log_audit_list("10", "Action Skipped Items", action_skipped_audit_records)
             _log_audit_list("11", "Excluded Items", excluded_audit_records)
             _log_audit_list("12", _action_audit_title(settings), action_audit_records)
-            return _completed_result(totals,action_skipped_count=len(action_skipped_audit_records),)
+            return _completed_result(
+                totals,
+                action_skipped_count=len(action_skipped_audit_records),
+            )
         finally:
             _remove_lock(lock_file)
 
