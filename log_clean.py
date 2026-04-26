@@ -1657,7 +1657,7 @@ with DAG(
     doc_md=__doc__,
 ) as dag:
 
-    @task
+    @task(pool="default_pool", pool_slots=1)
     def execute_cleanup() -> dict[str, Any]:
         settings = _build_settings(get_current_context().get("params") or {})
         task_started = time.monotonic()
