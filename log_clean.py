@@ -41,7 +41,7 @@ import textwrap
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +53,7 @@ LOGGER = logging.getLogger(__name__)
 
 __version__ = "2.09"
 
-DAG_ID = Path(__file__).stem
+DAG_ID = "airflow_log_cleanup"
 START_DATE = pendulum.datetime(2024, 1, 1, tz="Europe/Prague")
 SCHEDULE = "@daily"
 DAG_OWNER_NAME = "operations"
@@ -79,7 +79,6 @@ SECTION_WIDTHS: dict[str, list[int]] = {
     "00": [30, 50],
     "01": [10, 44, 22, 36, 72],
     "02": [10, 44, 22, 36, 72],
-    "03": [10, 44, 22, 36, 72],
     "04": [10, 18, 34, 110],
     "05": [36, 18, 12, 90],
     "06": [40, 26],
@@ -113,16 +112,15 @@ BROAD_ROOTS = {
 
 @dataclass(frozen=True)
 class TargetSpec:
-    """Resolved top-level target state under the validated cleanup root.
+    """Resolved top-level target under the validated cleanup root.
 
     Only real top-level directories may be included for cleanup traversal.
-    Symlinks and other non-directory entries are excluded explicitly so the
-    cleanup task never follows a top-level link outside the validated root.
+    Symlinks and other non-directory entries are retained as excluded targets
+    for audit output, but they are never traversed.
     """
 
     label: str
     path: str
-    state: str
     reason: str
     item_type: str = "directory"
 
@@ -155,7 +153,6 @@ class AuditRecord:
     real_path: str
     why: str
     observed_epoch: float = 0.0
-    observed_date: str = ""
     detail: str = ""
 
 
@@ -294,19 +291,32 @@ class RunTotals:
 
 @dataclass(frozen=True)
 class FileDeleteResult:
-    """Result of regular file deletion."""
+    """Result of regular file deletion.
+
+    ``skipped_records`` contains delete-phase safety skips. These are different
+    from scan-phase exclusions because the path was a valid old-file candidate
+    during scanning but became unsafe, unavailable, or inconsistent before the
+    delete operation completed.
+    """
 
     deleted: int = 0
     deleted_bytes: int = 0
-    deleted_records: list[tuple[str, float]] = field(default_factory=list)
+    deleted_records: tuple[tuple[str, float], ...] = ()
+    skipped_records: tuple[AuditRecord, ...] = ()
 
 
 @dataclass(frozen=True)
 class DirDeleteResult:
-    """Result of empty-directory deletion."""
+    """Result of empty-directory deletion.
+
+    ``skipped_records`` contains delete-phase directory skips. These explain why
+    a directory candidate was not removed after the empty-directory collection
+    phase selected it.
+    """
 
     deleted: int = 0
-    deleted_records: list[tuple[str, float]] = field(default_factory=list)
+    deleted_records: tuple[tuple[str, float], ...] = ()
+    skipped_records: tuple[AuditRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -347,6 +357,11 @@ def _as_bool(value: Any) -> bool:
 
 
 def _coerce_non_negative_int(value: Any, *, field_name: str) -> int:
+    """Coerce an Airflow Variable value into a strictly positive integer.
+
+    Retention set to zero is intentionally rejected because it makes nearly all
+    existing regular files eligible for cleanup immediately.
+    """
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be a non-negative integer, got bool.")
     try:
@@ -354,7 +369,7 @@ def _coerce_non_negative_int(value: Any, *, field_name: str) -> int:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be a non-negative integer, got {value!r}.") from exc
     if parsed < 0:
-        raise ValueError(f"{field_name} must be >= 0, got {parsed}.")
+        raise ValueError(f"{field_name} must be > 0, got {parsed}.")
     return parsed
 
 
@@ -498,12 +513,6 @@ def _path_identity(path: str | Path) -> str:
     return os.path.abspath(os.fspath(path))
 
 
-def _path_observed_datetime_text(epoch_value: float) -> str:
-    if epoch_value <= 0:
-        return ""
-    return datetime.fromtimestamp(epoch_value, tz=UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
 def _relative_path(path_str: str, cleanup_root: str) -> str:
     try:
         return str(Path(path_str).resolve(strict=False).relative_to(Path(cleanup_root)))
@@ -530,14 +539,13 @@ def _append_audit_record(
             real_path=_relative_path(path, cleanup_root),
             why=why,
             observed_epoch=observed_epoch,
-            observed_date=_path_observed_datetime_text(observed_epoch),
             detail=detail,
         )
     )
 
 
 def _dedupe_audit_records(records: list[AuditRecord]) -> list[AuditRecord]:
-    seen: set[tuple[str, str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, float, str]] = set()
     deduped: list[AuditRecord] = []
 
     for record in records:
@@ -545,7 +553,7 @@ def _dedupe_audit_records(records: list[AuditRecord]) -> list[AuditRecord]:
             record.item_type,
             record.real_path,
             record.why,
-            record.observed_date,
+            record.observed_epoch,
             record.detail,
         )
         if key not in seen:
@@ -593,8 +601,9 @@ def _audit_record_sort_key(record: AuditRecord) -> tuple[int, int, float, float,
     Sort behavior:
     - Regular age-threshold file records sort by item type, then age_days
       descending, so the oldest files are shown first.
-    - Deleted empty-directory records sort deepest path first, matching the
-      directory deletion order.
+    - Empty-directory action records sort deepest/longest path first for both
+      delete mode and dry-run candidate reporting. This mirrors safe directory
+      removal order, where leaf directories must be handled before parents.
     - Other records sort by item type, timestamp, path depth, path length, path.
     """
 
@@ -625,11 +634,13 @@ def _audit_record_sort_key(record: AuditRecord) -> tuple[int, int, float, float,
 
 
 def _group_audit_records_by_reason(records: list[AuditRecord]) -> list[tuple[str, list[AuditRecord]]]:
-    """Group deduplicated audit records by stable reason text.
+    """Group audit records by reason and sort each group deterministically.
 
-    Records inside each reason group are sorted by item type and then by
-    ``age_days`` when present in ``AuditRecord.detail``. Age-threshold records
-    are ordered from oldest to youngest file.
+    Age-based regular-file records are ordered from oldest to youngest.
+
+    Empty-directory cleanup records are ordered deepest/longest path first for
+    both dry-run candidate reporting and real delete reporting, so child
+    directories are shown before parent directories.
     """
 
     grouped: dict[str, list[AuditRecord]] = defaultdict(list)
@@ -637,17 +648,40 @@ def _group_audit_records_by_reason(records: list[AuditRecord]) -> list[tuple[str
     for record in _dedupe_audit_records(records):
         grouped[record.why].append(record)
 
-    return [
-        (
-            reason,
-            sorted(grouped[reason], key=_audit_record_sort_key),
-        )
-        for reason in sorted(grouped)
-    ]
+    result: list[tuple[str, list[AuditRecord]]] = []
+
+    for reason in sorted(grouped):
+        grouped_records = grouped[reason]
+
+        if reason in {
+            "would delete because directory would be empty during cleanup phase",
+            "deleted because directory was empty during cleanup phase",
+        }:
+            sorted_records = sorted(
+                grouped_records,
+                key=lambda record: (
+                    -len(Path(record.real_path).parts),
+                    -len(record.real_path),
+                    record.real_path,
+                    record.detail,
+                ),
+            )
+        else:
+            sorted_records = sorted(grouped_records, key=_audit_record_sort_key)
+
+        result.append((reason, sorted_records))
+
+    return result
 
 
 def _log_audit_list(number: str, title: str, records: list[AuditRecord]) -> None:
-    """Log audit records grouped by reason with one blank line between groups."""
+    """Log audit records grouped by reason with one blank line between groups.
+
+    Audit age is rendered once from ``observed_epoch`` as ``observed_age_days``.
+    Duplicate ``age_days`` values stored in technical detail are suppressed at
+    render time while preserving other useful detail fields, such as
+    ``threshold_days``.
+    """
 
     grouped = _group_audit_records_by_reason(records)
 
@@ -655,7 +689,7 @@ def _log_audit_list(number: str, title: str, records: list[AuditRecord]) -> None
         LOGGER.info("%s\n- none\n\n", _section_title(number, title))
         return
 
-    if title == "Deleted Items":
+    if title in {"Deleted Items", "Candidate Items"}:
         grouped = sorted(
             grouped,
             key=lambda item: (
@@ -666,6 +700,7 @@ def _log_audit_list(number: str, title: str, records: list[AuditRecord]) -> None
 
     lines: list[str] = []
     title_prefix = title.lower()
+    now_epoch = time.time()
 
     for group_index, (reason, grouped_records) in enumerate(grouped, start=1):
         lines.append(f"- {title_prefix} reason: {reason}")
@@ -673,11 +708,28 @@ def _log_audit_list(number: str, title: str, records: list[AuditRecord]) -> None
         for index, record in enumerate(grouped_records, start=1):
             suffix_parts: list[str] = []
 
-            if record.observed_date:
-                suffix_parts.append(f"observed_date={record.observed_date}")
+            if record.observed_epoch > 0:
+                observed_age_days = max(0.0, now_epoch - record.observed_epoch) / 86_400
+                suffix_parts.append(f"observed_age_days={observed_age_days:.2f}")
 
             if record.detail:
-                suffix_parts.append(f"detail={record.detail}")
+                retained_detail_parts: list[str] = []
+
+                for detail_part in record.detail.split(";"):
+                    normalized_detail_part = detail_part.strip()
+
+                    if not normalized_detail_part:
+                        continue
+
+                    detail_key = normalized_detail_part.partition("=")[0].strip()
+
+                    if detail_key in {"age_days", "size_bytes"}:
+                        continue
+
+                    retained_detail_parts.append(normalized_detail_part)
+
+                if retained_detail_parts:
+                    suffix_parts.append(f"detail={'; '.join(retained_detail_parts)}")
 
             suffix = f" | {' | '.join(suffix_parts)}" if suffix_parts else ""
             lines.append(f"  {index}. [{record.item_type}] {record.real_path}{suffix}")
@@ -702,7 +754,7 @@ def _resolve_top_level_targets(
 
     Only entries whose own inode is a real directory are included. Symlinks,
     regular files, sockets, FIFOs, devices, unreadable entries, and any other
-    non-directory entries are excluded and reported through target resolution.
+    non-directory entries are retained as excluded targets for audit output.
     """
 
     root = Path(base_log_folder)
@@ -734,7 +786,6 @@ def _resolve_top_level_targets(
                 TargetSpec(
                     label=label,
                     path=child_path,
-                    state="excluded",
                     reason="Excluded because top-level entry metadata is unreadable",
                     item_type="entry",
                 )
@@ -746,7 +797,6 @@ def _resolve_top_level_targets(
                 TargetSpec(
                     label=label,
                     path=child_path,
-                    state="excluded",
                     reason="Excluded because top-level entry is a symlink; symlink targets are never traversed",
                     item_type="symlink",
                 )
@@ -758,7 +808,6 @@ def _resolve_top_level_targets(
                 TargetSpec(
                     label=label,
                     path=child_path,
-                    state="excluded",
                     reason="Excluded because top-level entry is not a real directory",
                     item_type="entry",
                 )
@@ -770,7 +819,6 @@ def _resolve_top_level_targets(
                 TargetSpec(
                     label=label,
                     path=child_path,
-                    state="excluded",
                     reason="Excluded by TARGET_DENY_LIST",
                     item_type="directory",
                 )
@@ -781,7 +829,6 @@ def _resolve_top_level_targets(
             TargetSpec(
                 label=label,
                 path=child_path,
-                state="included",
                 reason="Included by validated base root scope with its subfolders",
                 item_type="directory",
             )
@@ -1195,12 +1242,13 @@ def _collect_empty_directories(
     )
 
 
-def _delete_files(candidates: list[FileCandidate]) -> FileDeleteResult:
+def _delete_files(candidates: list[FileCandidate], *, report_root: str) -> FileDeleteResult:
     """Delete scanned regular file candidates after identity revalidation.
 
     A path is deleted only when the current filesystem object still matches the
     scan-time regular file identity. If the path disappeared, became unreadable,
-    became non-regular, or was replaced by another inode, it is skipped.
+    became non-regular, or was replaced by another inode, it is skipped and
+    captured as a structured delete-phase audit record.
 
     This deliberately treats delete-time inconsistencies as skip conditions
     instead of crashing the DAG run. The cleanup task should be conservative:
@@ -1210,6 +1258,7 @@ def _delete_files(candidates: list[FileCandidate]) -> FileDeleteResult:
     deleted = 0
     deleted_bytes = 0
     deleted_records: list[tuple[str, float]] = []
+    skipped_records: list[AuditRecord] = []
 
     for candidate in candidates:
         path = Path(candidate.path)
@@ -1217,12 +1266,30 @@ def _delete_files(candidates: list[FileCandidate]) -> FileDeleteResult:
         try:
             current_stat = path.stat(follow_symlinks=False)
         except FileNotFoundError:
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=candidate.path,
+                item_type="file",
+                why="delete skipped because file disappeared before deletion",
+                observed_epoch=candidate.mtime,
+                detail=f"scan_size_bytes={candidate.size_bytes}",
+            )
             continue
         except OSError as exc:
             LOGGER.warning(
                 "Skipping file deletion candidate with unreadable metadata: %s: %s",
                 path,
                 exc,
+            )
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=candidate.path,
+                item_type="file",
+                why="delete skipped because file metadata became unreadable",
+                observed_epoch=candidate.mtime,
+                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
             )
             continue
 
@@ -1231,21 +1298,77 @@ def _delete_files(candidates: list[FileCandidate]) -> FileDeleteResult:
                 "Skipping file deletion candidate because it is not a regular file: %s",
                 path,
             )
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=candidate.path,
+                item_type="entry",
+                why="delete skipped because candidate is no longer a regular file",
+                observed_epoch=float(current_stat.st_mtime),
+                detail=f"mode={oct(stat.S_IMODE(current_stat.st_mode))}",
+            )
             continue
 
-        if int(current_stat.st_dev) != candidate.device or int(current_stat.st_ino) != candidate.inode or float(current_stat.st_mtime) != candidate.mtime or int(current_stat.st_size) != candidate.size_bytes:
+        current_identity = (
+            int(current_stat.st_dev),
+            int(current_stat.st_ino),
+            float(current_stat.st_mtime),
+            int(current_stat.st_size),
+        )
+        expected_identity = (
+            candidate.device,
+            candidate.inode,
+            candidate.mtime,
+            candidate.size_bytes,
+        )
+
+        if current_identity != expected_identity:
             LOGGER.warning(
                 "Skipping file deletion candidate because it changed after scan: %s",
                 path,
+            )
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=candidate.path,
+                item_type="file",
+                why="delete skipped because candidate changed after scan",
+                observed_epoch=float(current_stat.st_mtime),
+                detail=(
+                    f"scan_device={candidate.device}; "
+                    f"scan_inode={candidate.inode}; "
+                    f"scan_size_bytes={candidate.size_bytes}; "
+                    f"current_device={int(current_stat.st_dev)}; "
+                    f"current_inode={int(current_stat.st_ino)}; "
+                    f"current_size_bytes={int(current_stat.st_size)}"
+                ),
             )
             continue
 
         try:
             path.unlink()
         except FileNotFoundError:
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=candidate.path,
+                item_type="file",
+                why="delete skipped because file disappeared before unlink",
+                observed_epoch=candidate.mtime,
+                detail=f"scan_size_bytes={candidate.size_bytes}",
+            )
             continue
         except OSError as exc:
             LOGGER.warning("Failed deleting file candidate: %s: %s", path, exc)
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=candidate.path,
+                item_type="file",
+                why="delete skipped because unlink failed",
+                observed_epoch=candidate.mtime,
+                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+            )
             continue
 
         deleted += 1
@@ -1255,11 +1378,12 @@ def _delete_files(candidates: list[FileCandidate]) -> FileDeleteResult:
     return FileDeleteResult(
         deleted=deleted,
         deleted_bytes=deleted_bytes,
-        deleted_records=deleted_records,
+        deleted_records=tuple(deleted_records),
+        skipped_records=tuple(skipped_records),
     )
 
 
-def _delete_directories(paths: list[str]) -> DirDeleteResult:
+def _delete_directories(paths: list[str], *, report_root: str) -> DirDeleteResult:
     """Delete empty directories after revalidating each path safely.
 
     The function deletes only real directories. It does not rely on
@@ -1267,10 +1391,15 @@ def _delete_directories(paths: list[str]) -> DirDeleteResult:
     revalidated with ``follow_symlinks=False`` immediately before ``rmdir()``.
     Non-existing paths, non-directories, symlinks, and non-empty directories are
     skipped.
+
+    Only real directories are removed. Symlinks, missing paths, non-directories,
+    unreadable paths, non-empty directories, and failed removals are skipped and
+    captured as structured delete-phase audit records.
     """
 
     deleted = 0
     deleted_records: list[tuple[str, float]] = []
+    skipped_records: list[AuditRecord] = []
 
     for path_str in _sort_directories_deepest_first(paths):
         path = Path(path_str)
@@ -1278,13 +1407,37 @@ def _delete_directories(paths: list[str]) -> DirDeleteResult:
         try:
             path_stat = path.stat(follow_symlinks=False)
         except FileNotFoundError:
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=path_str,
+                item_type="directory",
+                why="delete skipped because directory disappeared before deletion",
+            )
             continue
         except OSError as exc:
             LOGGER.warning("Skipping directory deletion candidate with unreadable metadata: %s: %s", path, exc)
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=path_str,
+                item_type="directory",
+                why="delete skipped because directory metadata became unreadable",
+                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+            )
             continue
 
         if not stat.S_ISDIR(path_stat.st_mode):
             LOGGER.warning("Skipping directory deletion candidate because it is not a real directory: %s", path)
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=path_str,
+                item_type="entry",
+                why="delete skipped because candidate is no longer a real directory",
+                observed_epoch=float(path_stat.st_mtime),
+                detail=f"mode={oct(stat.S_IMODE(path_stat.st_mode))}",
+            )
             continue
 
         observed_epoch = float(path_stat.st_mtime)
@@ -1292,15 +1445,49 @@ def _delete_directories(paths: list[str]) -> DirDeleteResult:
         try:
             path.rmdir()
         except FileNotFoundError:
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=path_str,
+                item_type="directory",
+                why="delete skipped because directory disappeared before rmdir",
+                observed_epoch=observed_epoch,
+            )
             continue
         except NotADirectoryError:
             LOGGER.warning("Skipping directory deletion candidate because it stopped being a directory: %s", path)
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=path_str,
+                item_type="entry",
+                why="delete skipped because candidate stopped being a directory",
+                observed_epoch=observed_epoch,
+            )
             continue
         except OSError as exc:
             if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                _append_audit_record(
+                    skipped_records,
+                    cleanup_root=report_root,
+                    path=path_str,
+                    item_type="directory",
+                    why="delete skipped because directory was not empty at rmdir time",
+                    observed_epoch=observed_epoch,
+                    detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+                )
                 continue
 
             LOGGER.warning("Failed deleting empty directory candidate: %s: %s", path, exc)
+            _append_audit_record(
+                skipped_records,
+                cleanup_root=report_root,
+                path=path_str,
+                item_type="directory",
+                why="delete skipped because rmdir failed",
+                observed_epoch=observed_epoch,
+                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+            )
             continue
 
         deleted += 1
@@ -1308,7 +1495,8 @@ def _delete_directories(paths: list[str]) -> DirDeleteResult:
 
     return DirDeleteResult(
         deleted=deleted,
-        deleted_records=deleted_records,
+        deleted_records=tuple(deleted_records),
+        skipped_records=tuple(skipped_records),
     )
 
 
@@ -1347,17 +1535,11 @@ def _evaluated_state_rows(settings: CleanupSettings) -> list[list[Any]]:
         [10, "VALIDATED_BASE_LOG_FOLDER", "evaluated", settings.base_log_folder, "Single validated cleanup root"],
         [20, "TARGET_DENY_LIST_VALID", "parsed", settings.target_deny_list, "Valid top-level names excluded from evaluated root scope"],
         [30, "TARGET_DENY_LIST_INVALID", "parsed", settings.invalid_target_deny_list, "Ignored because names are not safe top-level folder names"],
-        [40, "EVALUATED_EXCLUDED_TARGETS", "evaluated", [target.label for target in settings.excluded_targets], "Resolved targets excluded by TARGET_DENY_LIST"],
+        [40, "EVALUATED_EXCLUDED_TARGETS", "evaluated", [target.label for target in settings.excluded_targets], "Resolved targets excluded by TARGET_DENY_LIST (symlink, non-directory, and unreadable entries)"],
         [50, "MAX_LOG_AGE_DAYS", "evaluated", settings.max_log_age_days, "Retention threshold in full days"],
         [60, "DRY_RUN", "evaluated", settings.dry_run, "Report candidates without deleting"],
         [70, "EFFECTIVE_DELETE_MODE", "evaluated", settings.effective_delete_mode, "Final execution mode after dry-run and code-side delete switch"],
     ]
-
-
-def _target_resolution_rows(settings: CleanupSettings) -> list[list[Any]]:
-    items = [(target.label, target.state, target.path, target.reason) for group in (settings.included_targets, settings.excluded_targets) for target in group]
-    items.sort(key=lambda item: (len(item[2]), item[2], item[0], item[1]))
-    return [[index * 10, label, state, path, reason] for index, (label, state, path, reason) in enumerate(items, start=1)]
 
 
 def _deletion_scope_rows(max_age_days: int, *, dry_run: bool) -> list[list[Any]]:
@@ -1381,6 +1563,12 @@ def _root_scan_summary_rows(totals: RunTotals) -> list[list[Any]]:
         method = metric.evaluation_method if isinstance(value, int) and value > 0 else ""
         rows.append([metric.summary_item, rendered_value, decision, method])
     return rows
+
+
+def _action_audit_title(settings: CleanupSettings) -> str:
+    """Return the section title for action audit records."""
+
+    return "Deleted Items" if settings.effective_delete_mode == "delete" else "Candidate Items"
 
 
 def _action_outcome_rows(settings: CleanupSettings, totals: RunTotals) -> list[tuple[str, Any]]:
@@ -1487,19 +1675,20 @@ with DAG(
         )
         _log_info_table("01", "Configurable switches", ["Priority", "SwitchOrParameter", "SourceType", "CurrentValue", "Purpose"], _switch_rows(settings))
         _log_info_table("02", "Evaluated State", ["Priority", "State", "Source", "Value", "Meaning"], _evaluated_state_rows(settings))
-        _log_info_table("03", "Target Resolution", ["Priority", "Target sample", "State", "Path", "Reason"], _target_resolution_rows(settings))
         _log_info_table("04", "Deletion Scope and Exclusions", ["Priority", "Area", "Subject", "Explanation"], _deletion_scope_rows(settings.max_log_age_days, dry_run=settings.dry_run))
 
         lock_file = Path(settings.lock_file_path)
         if not _try_create_lock(lock_file):
             result = _locked_result(round(time.monotonic() - task_started, 3))
             _log_section("07", "Overall Outcome", [("status", result["status"]), ("roots_processed", result["roots_processed"]), ("duration_seconds", result["duration_seconds"])])
-            _log_audit_list("10", "Deleted Items", [])
-            _log_audit_list("11", "Excluded Items", [])
+            _log_audit_list("10", "Excluded Items", [])
+            _log_audit_list("11", "Action Skipped Items", [])
+            _log_audit_list("12", _action_audit_title(settings), [])
             return result
 
         totals = RunTotals()
-        deleted_audit_records: list[AuditRecord] = []
+        action_audit_records: list[AuditRecord] = []
+        action_skipped_audit_records: list[AuditRecord] = []
         excluded_audit_records: list[AuditRecord] = []
 
         for target in settings.excluded_targets:
@@ -1520,7 +1709,6 @@ with DAG(
                     max_age_days=settings.max_log_age_days,
                     report_root=settings.base_log_folder,
                 )
-
                 if settings.dry_run or not settings.delete_enabled:
                     deleted_files = FileDeleteResult()
                     empty_dir_result = _collect_empty_directories(
@@ -1530,45 +1718,76 @@ with DAG(
                     )
                     deleted_dirs = DirDeleteResult()
                 else:
-                    deleted_files = _delete_files(scan_result.old_files)
+                    deleted_files = _delete_files(
+                        scan_result.old_files,
+                        report_root=settings.base_log_folder,
+                    )
+
                     empty_dir_result = _collect_empty_directories(
                         cleanup_root,
                         report_root=settings.base_log_folder,
                     )
-                    deleted_dirs = _delete_directories(empty_dir_result.empty_directories)
+                    deleted_dirs = _delete_directories(
+                        empty_dir_result.empty_directories,
+                        report_root=settings.base_log_folder,
+                    )
 
                 totals.add_scan(scan_result.stats, old_file_candidates=len(scan_result.old_files), empty_dir_candidates=len(empty_dir_result.empty_directories))
                 totals.add_action(files_deleted=deleted_files.deleted, files_deleted_bytes=deleted_files.deleted_bytes, empty_dirs_deleted=deleted_dirs.deleted)
 
                 excluded_audit_records.extend(scan_result.excluded_records)
+                action_skipped_audit_records.extend(deleted_files.skipped_records)
+                action_skipped_audit_records.extend(deleted_dirs.skipped_records)
                 excluded_audit_records.extend(empty_dir_result.excluded_records)
 
-                if not settings.dry_run and settings.delete_enabled:
+                if settings.effective_delete_mode == "delete":
                     for path_str, observed_epoch in deleted_files.deleted_records:
                         _append_audit_record(
-                            deleted_audit_records,
+                            action_audit_records,
                             cleanup_root=settings.base_log_folder,
                             path=path_str,
                             item_type="file",
                             why=f"deleted because regular file age exceeded {settings.max_log_age_days}d",
                             observed_epoch=float(observed_epoch),
                         )
+
                     for path_str, observed_epoch in deleted_dirs.deleted_records:
                         _append_audit_record(
-                            deleted_audit_records,
+                            action_audit_records,
                             cleanup_root=settings.base_log_folder,
                             path=path_str,
                             item_type="directory",
                             why="deleted because directory was empty during cleanup phase",
                             observed_epoch=float(observed_epoch),
                         )
+                else:
+                    for candidate in scan_result.old_files:
+                        _append_audit_record(
+                            action_audit_records,
+                            cleanup_root=settings.base_log_folder,
+                            path=candidate.path,
+                            item_type="file",
+                            why=f"would delete because regular file age exceeded {settings.max_log_age_days}d",
+                            observed_epoch=float(candidate.mtime),
+                            detail=f"size_bytes={candidate.size_bytes}",
+                        )
+
+                    for path_str in empty_dir_result.empty_directories:
+                        _append_audit_record(
+                            action_audit_records,
+                            cleanup_root=settings.base_log_folder,
+                            path=path_str,
+                            item_type="directory",
+                            why="would delete because directory would be empty during cleanup phase",
+                        )
 
             totals.duration_seconds = round(time.monotonic() - task_started, 3)
             _log_info_table("05", "Root Scan Summary", ["SummaryItem", "Value", "Decision", "EvaluationMethod"], _root_scan_summary_rows(totals))
             _log_section("06", "Action Outcome Summary", _action_outcome_rows(settings, totals))
             _log_section("07", "Overall Outcome", _overall_outcome_rows(totals))
-            _log_audit_list("10", "Deleted Items", deleted_audit_records)
-            _log_audit_list("11", "Excluded Items", excluded_audit_records)
+            _log_audit_list("10", "Excluded Items", excluded_audit_records)
+            _log_audit_list("11", "Action Skipped Items", action_skipped_audit_records)
+            _log_audit_list("12", _action_audit_title(settings), action_audit_records)
             return _completed_result(totals)
         finally:
             _remove_lock(lock_file)
