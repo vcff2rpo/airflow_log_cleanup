@@ -533,12 +533,26 @@ def _path_identity(path: str | Path) -> str:
 
 
 def _relative_path(path_str: str, cleanup_root: str) -> str:
+    """Render a path relative to the cleanup root for audit output.
+
+    The function first tries a resolved path comparison to normalize filesystem
+    representation. If resolution fails because of OS/path issues, it falls back
+    to a non-resolved relative comparison.
+
+    If the path cannot be represented below ``cleanup_root``, the original path
+    string is returned unchanged. This keeps audit rendering non-fatal while
+    avoiding broad exception handling.
+    """
+
+    path = Path(path_str)
+    root = Path(cleanup_root)
+
     try:
-        return str(Path(path_str).resolve(strict=False).relative_to(Path(cleanup_root)))
-    except Exception:
+        return str(path.resolve(strict=False).relative_to(root))
+    except (OSError, RuntimeError, ValueError):
         try:
-            return str(Path(path_str).relative_to(Path(cleanup_root)))
-        except Exception:
+            return str(path.relative_to(root))
+        except ValueError:
             return path_str
 
 
@@ -1632,7 +1646,7 @@ def _locked_result(duration_seconds: float) -> dict[str, Any]:
     }
 
 
-def _completed_result(totals: RunTotals) -> dict[str, Any]:
+def _completed_result(totals: RunTotals, *, action_skipped_count: int) -> dict[str, Any]:
     return {
         "status": "completed",
         "roots_processed": totals.roots_processed,
@@ -1648,6 +1662,7 @@ def _completed_result(totals: RunTotals) -> dict[str, Any]:
         "files_deleted_bytes": totals.files_deleted_bytes,
         "empty_dirs_deleted": totals.empty_dirs_deleted,
         "duration_seconds": totals.duration_seconds,
+        "action_skipped_items": action_skipped_count,
     }
 
 
@@ -1802,7 +1817,7 @@ with DAG(
             _log_audit_list("10", "Action Skipped Items", action_skipped_audit_records)
             _log_audit_list("11", "Excluded Items", excluded_audit_records)
             _log_audit_list("12", _action_audit_title(settings), action_audit_records)
-            return _completed_result(totals)
+            return _completed_result(totals,action_skipped_count=len(action_skipped_audit_records),)
         finally:
             _remove_lock(lock_file)
 
