@@ -87,6 +87,7 @@ SECTION_WIDTHS: dict[str, list[int]] = {
     "04": [10, 18, 34, 110],
     "05": [36, 18, 12, 55],
     "06": [40, 26],
+    "08": [10, 44, 22, 36, 72],
     "07": [40, 26],
     "99": [24, 100],
 }
@@ -186,9 +187,9 @@ class AuditBucket:
         self.add_rendered_sample(record, limit=limit)
 
     def add_rendered_sample(self, record: AuditRecord, *, limit: int) -> None:
-        if len(self.rendered) >= max(1, limit):
+        if limit > 0 and len(self.rendered) >= limit:
             return
-
+    
         key = _audit_record_key(record)
         if key in self._rendered_keys:
             return
@@ -733,7 +734,7 @@ def _add_audit_record(
     )
     records.setdefault(record.why, AuditBucket()).add(
         record,
-        limit=max(1, audit_limit),
+        limit=audit_limit,
     )
 
 
@@ -743,7 +744,7 @@ def _merge_audit_buckets(
     *,
     audit_limit: int,
 ) -> None:
-    render_limit = max(1, audit_limit)
+    render_limit = audit_limit
 
     for reason, source_bucket in source.items():
         target_bucket = target.setdefault(reason, AuditBucket())
@@ -871,15 +872,18 @@ def _log_audit_list(
 
     lines: list[str] = []
     title_prefix = title.lower()
-    render_limit = max(1, delete_log_cap)
-
+    cap_enabled = delete_log_cap > 0
+    cap_label = f"DELETE_LOG_CAP={delete_log_cap}" if cap_enabled else "DELETE_LOG_CAP=disabled"
+    
     for group_index, (reason, group_total, grouped_records) in enumerate(grouped, start=1):
-        rendered_group_records = grouped_records[:render_limit]
+        rendered_group_records = grouped_records[:delete_log_cap] if cap_enabled else grouped_records
         rendered_count = len(rendered_group_records)
-        capped_count = max(0, group_total - rendered_count)
-
-        lines.append(f"- {title_prefix} reason: {reason} | total_items={group_total} | rendered_items={rendered_count} | capped_items={capped_count} | DELETE_LOG_CAP={render_limit}")
-
+        capped_count = max(0, group_total - rendered_count) if cap_enabled else 0
+    
+        lines.append(
+            f"- {title_prefix} reason: {reason} | total_items={group_total} | "
+            f"rendered_items={rendered_count} | capped_items={capped_count} | {cap_label}"
+        )
         for index, record in enumerate(rendered_group_records, start=1):
             suffix_parts: list[str] = []
 
@@ -896,7 +900,7 @@ def _log_audit_list(
             lines.append(f"  {index}. [{record.item_type}] {record.real_path}{suffix}")
 
         if capped_count > 0:
-            lines.append(f"  ... capped {capped_count} item(s) by DELETE_LOG_CAP={render_limit}")
+            lines.append(f"  ... capped {capped_count} item(s) by DELETE_LOG_CAP={delete_log_cap}")
 
         if group_index < len(grouped):
             lines.append(" ")
@@ -1050,16 +1054,18 @@ def _build_settings(params: dict[str, Any]) -> CleanupSettings:
         field_name=TARGET_DENY_LIST_VARIABLE_KEY,
     )
 
-    delete_log_cap = 1
-    try:
-        delete_log_cap = _coerce_positive_int(
-            Variable.get(DELETE_LOG_CAP_VARIABLE_KEY, default="10"),
-            field_name=DELETE_LOG_CAP_VARIABLE_KEY,
-            zero_is_skip=False,
-        )
-    except (AirflowSkipException, ValueError) as exc:
-        config_errors.append((DELETE_LOG_CAP_VARIABLE_KEY, str(exc)))
-
+    effective_delete_mode = "report-only" if dry_run or not DELETE_ENABLED else "delete"
+    delete_log_cap = 0
+    if effective_delete_mode == "delete":
+        try:
+            delete_log_cap = _coerce_positive_int(
+                Variable.get(DELETE_LOG_CAP_VARIABLE_KEY, default="10"),
+                field_name=DELETE_LOG_CAP_VARIABLE_KEY,
+                zero_is_skip=False,
+            )
+        except (AirflowSkipException, ValueError) as exc:
+            config_errors.append((DELETE_LOG_CAP_VARIABLE_KEY, str(exc)))
+    
     max_log_age_days = 1
     try:
         max_log_age_days = _coerce_positive_int(
@@ -1915,7 +1921,7 @@ def _switch_rows(settings: CleanupSettings) -> list[list[Any]]:
         [10, "LOGGING__BASE_LOG_FOLDER", "airflow.cfg", settings.base_log_folder, "Single validated cleanup root"],
         [20, "TARGET_DENY_LIST", "Airflow Variable", settings.target_deny_list, "Optional protected top-level targets"],
         [30, "MAX_LOG_AGE_DAYS", "Airflow Variable", settings.max_log_age_days, "Retention threshold in full days for file eligibility"],
-        [40, "DELETE_LOG_CAP", "Airflow Variable", settings.delete_log_cap, "Maximum rendered audit sample items per reason group in dry-run and delete mode"],
+        [40, "DELETE_LOG_CAP", "Airflow Variable", settings.delete_log_cap if settings.effective_delete_mode == "delete" else "disabled", "Maximum rendered audit sample items per reason group in dry-run and delete mode"],
         [50, "DRY_RUN", "DAG Param", settings.dry_run, "If true, candidates are reported but nothing is deleted"],
         [60, "DELETE_ENABLED", "Code constant", settings.delete_enabled, "Global code-side delete capability switch"],
         [70, "LOCK_FILE_PATH", "Code constant", settings.lock_file_path, "Shared worker lock used to prevent concurrent cleanup collisions"],
@@ -1929,7 +1935,7 @@ def _evaluated_state_rows(settings: CleanupSettings) -> list[list[Any]]:
         [30, "TARGET_DENY_LIST_INVALID", "parsed", settings.invalid_target_deny_list, "Ignored because names are not safe top-level folder names"],
         [40, "EVALUATED_EXCLUDED_TARGETS", "evaluated", [target.label for target in settings.excluded_targets], "Resolved targets excluded by TARGET_DENY_LIST (symlink, non-directory, and unreadable entries)"],
         [50, "MAX_LOG_AGE_DAYS", "evaluated", settings.max_log_age_days, "Retention threshold in full days"],
-        [60, "DELETE_LOG_CAP", "evaluated", settings.delete_log_cap, "Maximum rendered audit sample items per reason group in dry-run and delete mode"],
+        [60, "DELETE_LOG_CAP", "evaluated", settings.delete_log_cap if settings.effective_delete_mode == "delete" else "disabled", "Audit sample cap is applied only in delete mode; dry-run renders uncapped audit samples"],
         [70, "DRY_RUN", "evaluated", settings.dry_run, "Report candidates without deleting"],
         [80, "EFFECTIVE_DELETE_MODE", "evaluated", settings.effective_delete_mode, "Final execution mode after dry-run and code-side delete switch"],
     ]
@@ -1973,7 +1979,7 @@ def _append_action_audit_records(
     deleted_files: FileDeleteResult,
     deleted_dirs: DirDeleteResult,
 ) -> None:
-    audit_limit = max(1, settings.delete_log_cap)
+    audit_limit = max(1, settings.delete_log_cap) if settings.effective_delete_mode == "delete" else 0
 
     if settings.effective_delete_mode == "delete":
         for record in deleted_files.deleted_records:
@@ -2009,7 +2015,6 @@ def _append_action_audit_records(
             item_type="file",
             why=f"would delete because regular file age exceeded {settings.max_log_age_days}d",
             observed_epoch=float(candidate.mtime),
-            details=_audit_details(size_bytes=candidate.size_bytes),
         )
 
     for candidate in empty_dir_result.empty_directories:
@@ -2205,7 +2210,7 @@ with DAG(
         if advisory_rows:
             _log_table(
                 level=logging.WARNING,
-                number="03",
+                number="08",
                 title="Configuration Advisories",
                 headers=["Priority", "Source", "Advisory", "Value", "Meaning"],
                 rows=advisory_rows,
@@ -2261,7 +2266,7 @@ with DAG(
         action_audit_records: AuditBuckets = _new_audit_buckets()
         action_skipped_audit_records: AuditBuckets = _new_audit_buckets()
         excluded_audit_records: AuditBuckets = _new_audit_buckets()
-        audit_limit = max(1, settings.delete_log_cap)
+        audit_limit = max(1, settings.delete_log_cap) if settings.effective_delete_mode == "delete" else 0
 
         for target in settings.excluded_targets:
             _add_audit_record(
