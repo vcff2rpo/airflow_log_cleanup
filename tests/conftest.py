@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 from collections.abc import Callable, Iterator
@@ -9,7 +10,7 @@ from typing import Any, Literal, cast
 
 import pytest
 
-MODULE_RELATIVE_PATH = "log_clean.py"
+MODULE_RELATIVE_PATH = os.environ.get("LOG_CLEAN_MODULE_PATH", "log_clean.py")
 
 
 class VariableStore:
@@ -34,6 +35,14 @@ class DummyConf:
 
 class AirflowSkipException(Exception):
     """Small stand-in for airflow.exceptions.AirflowSkipException."""
+
+
+class DummyParam:
+    """Small airflow.sdk.Param replacement preserving constructor inputs."""
+
+    def __init__(self, default: Any, **kwargs: Any) -> None:
+        self.default = default
+        self.kwargs = kwargs
 
 
 class DummyDAG:
@@ -89,6 +98,7 @@ def airflow_stub_modules(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     sdk_module = types.ModuleType("airflow.sdk")
     sdk_module_any = cast(Any, sdk_module)
     sdk_module_any.DAG = DummyDAG
+    sdk_module_any.Param = DummyParam
     sdk_module_any.Variable = VariableStore
     sdk_module_any.get_current_context = get_current_context
     sdk_module_any.task = task
@@ -115,11 +125,11 @@ def airflow_stub_modules(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 @pytest.fixture()
 def import_log_clean(
     airflow_stub_modules: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[Any]:
     """Import a fresh copy of log_clean.py for each test with stubbed dependencies."""
-    module_path = Path(__file__).resolve().parents[1] / MODULE_RELATIVE_PATH
+    configured_path = Path(MODULE_RELATIVE_PATH)
+    module_path = configured_path if configured_path.is_absolute() else Path(__file__).resolve().parents[1] / configured_path
     module_name = "log_clean"
 
     VariableStore.values = {}

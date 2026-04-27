@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -8,32 +9,39 @@ from typing import Any
 
 import pytest
 
+SECONDS_PER_DAY = 86_400
+
 
 def set_mtime(path: Path, *, age_days: int) -> None:
     """Set a file or directory mtime to now minus the requested age."""
-    ts = time.time() - (age_days * 86400)
-    os.utime(path, (ts, ts))
+    timestamp = time.time() - (age_days * SECONDS_PER_DAY)
+    os.utime(path, (timestamp, timestamp))
 
 
-def force_same_device_stats(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
-    """Normalize st_dev for paths below one root so scan tests are deterministic."""
-    original_stat = Path.stat
-    root_device = original_stat(root, follow_symlinks=False).st_dev
+def rendered_records(records: dict[str, Any]) -> list[Any]:
+    """Flatten rendered audit samples from the DAG audit-bucket mapping."""
+    return [record for bucket in records.values() for record in bucket.rendered]
 
-    def patched_stat(self: Path, *, follow_symlinks: bool = True) -> Any:
-        result = original_stat(self, follow_symlinks=follow_symlinks)
-        if self == root or root in self.parents:
-            return SimpleNamespace(
-                st_mode=result.st_mode,
-                st_ino=result.st_ino,
-                st_dev=root_device,
-                st_size=result.st_size,
-                st_mtime_ns=result.st_mtime_ns,
-                st_mtime=result.st_mtime,
-            )
-        return result
 
-    monkeypatch.setattr(Path, "stat", patched_stat)
+def dir_candidate(module: Any, path: Path) -> Any:
+    stat_result = path.stat(follow_symlinks=False)
+    return module.DirCandidate(
+        path=str(path),
+        device=int(stat_result.st_dev),
+        inode=int(stat_result.st_ino),
+    )
+
+
+def file_candidate(module: Any, path: Path) -> Any:
+    stat_result = path.stat(follow_symlinks=False)
+    return module.FileCandidate(
+        path=str(path),
+        device=int(stat_result.st_dev),
+        inode=int(stat_result.st_ino),
+        mtime=float(stat_result.st_mtime),
+        mtime_ns=int(stat_result.st_mtime_ns),
+        size_bytes=int(stat_result.st_size),
+    )
 
 
 def test_module_smoke_imports_and_exposes_dag(import_log_clean: Any) -> None:
@@ -41,43 +49,35 @@ def test_module_smoke_imports_and_exposes_dag(import_log_clean: Any) -> None:
 
     assert module.DAG_ID == "airflow_log_cleanup"
     assert module.SCHEDULE == "@daily"
+    assert module.DELETE_ENABLED is True
     assert module.dag is not None
     assert callable(module.execute_cleanup)
 
 
-@pytest.mark.parametrize(
-    ("raw_value", "expected"),
-    [
-        (True, True),
-        (False, False),
-        ("true", True),
-        ("TRUE", True),
-        (" false ", False),
-        ("1", False),
-    ],
-)
-def test_as_bool_normalizes_common_inputs(import_log_clean: Any, raw_value: Any, expected: bool) -> None:
-    module = import_log_clean
-
-    assert module._as_bool(raw_value) is expected
-
-
-@pytest.mark.parametrize("raw_value", [1, "1", 7, "12"])
+@pytest.mark.parametrize("raw_value", [1, "1", " 7 ", 12])
 def test_coerce_positive_int_accepts_positive_values(import_log_clean: Any, raw_value: Any) -> None:
     module = import_log_clean
 
-    assert module._coerce_positive_int(raw_value, field_name="x") == int(raw_value)
+    assert module._coerce_positive_int(raw_value, field_name="x") == int(str(raw_value).strip())
 
 
 @pytest.mark.parametrize("raw_value", [0, "0"])
 def test_coerce_positive_int_skips_zero_retention(import_log_clean: Any, raw_value: Any) -> None:
     module = import_log_clean
 
-    with pytest.raises(module.AirflowSkipException):
+    with pytest.raises(module.AirflowSkipException, match="x=0 is unsafe"):
         module._coerce_positive_int(raw_value, field_name="x")
 
 
-@pytest.mark.parametrize("raw_value", [True, -1, "-3", "abc", None])
+@pytest.mark.parametrize("raw_value", [0, "0"])
+def test_coerce_positive_int_rejects_zero_when_skip_disabled(import_log_clean: Any, raw_value: Any) -> None:
+    module = import_log_clean
+
+    with pytest.raises(ValueError, match="x must be > 0"):
+        module._coerce_positive_int(raw_value, field_name="x", zero_is_skip=False)
+
+
+@pytest.mark.parametrize("raw_value", [True, False, -1, "-3", "abc", None])
 def test_coerce_positive_int_rejects_invalid_values(import_log_clean: Any, raw_value: Any) -> None:
     module = import_log_clean
 
@@ -85,39 +85,144 @@ def test_coerce_positive_int_rejects_invalid_values(import_log_clean: Any, raw_v
         module._coerce_positive_int(raw_value, field_name="x")
 
 
-@pytest.mark.parametrize("path_value", ["relative/path", "/", "/tmp", "/var/log"])
-def test_validate_cleanup_root_rejects_unsafe_locations(import_log_clean: Any, path_value: str) -> None:
+@pytest.mark.parametrize(
+    ("num_bytes", "expected"),
+    [
+        (0, "0 B"),
+        (1, "1 B"),
+        (1024, "1.00 KiB"),
+        (1536, "1.50 KiB"),
+    ],
+)
+def test_human_bytes_renders_binary_units(import_log_clean: Any, num_bytes: int, expected: str) -> None:
     module = import_log_clean
 
-    with pytest.raises(ValueError):
-        module._validate_cleanup_root(path_value)
+    assert module._human_bytes(num_bytes) == expected
 
 
-def test_validate_cleanup_root_accepts_specific_absolute_path(import_log_clean: Any, tmp_path: Path) -> None:
+def test_log_table_renders_header_rows_and_final_border(import_log_clean: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     module = import_log_clean
-    candidate = tmp_path / "nested" / "logs"
-    candidate.mkdir(parents=True)
+    captured: list[str] = []
 
-    assert module._validate_cleanup_root(str(candidate)) == str(candidate.resolve())
+    def capture_log(level: int, fmt: str, *args: Any, **_kwargs: Any) -> None:
+        captured.append(fmt % args)
 
+    monkeypatch.setattr(module.LOGGER, "log", capture_log)
 
-def test_parse_target_name_list_dedupes_and_filters_invalid_entries(import_log_clean: Any) -> None:
-    module = import_log_clean
-
-    valid, invalid = module._parse_target_name_list(
-        " scheduler , scheduler, worker, ../escape, bad/name, ., \\, worker ",
-        field_name="TARGET_DENY_LIST",
+    module._log_table(
+        level=logging.INFO,
+        number="99",
+        title="Test Table",
+        headers=["Field", "Value"],
+        rows=[["flag", True], ["items", ["a", "b"]], ["path", Path("/tmp/x")]],
     )
 
-    assert valid == ["scheduler", "worker"]
-    assert invalid == [".", "../escape", "\\", "bad/name"]
+    assert captured
+    rendered = captured[0]
+    lines = rendered.splitlines()
+    assert lines[0].startswith("99 :: Test Table")
+    table_lines = lines[1:]
+    assert table_lines[0].startswith("+")
+    assert table_lines[-1].startswith("+")
+    assert "true" in rendered
+    assert "a, b" in rendered
+    assert "/tmp/x" in rendered
 
 
-def test_resolve_top_level_targets_tracks_included_and_excluded(import_log_clean: Any, tmp_path: Path) -> None:
+def test_audit_details_filters_empty_values_and_stringifies_complex_values(import_log_clean: Any) -> None:
+    module = import_log_clean
+
+    details = module._audit_details(
+        none_value=None,
+        empty_value="",
+        bool_value=False,
+        int_value=7,
+        complex_value={"x": 1},
+    )
+
+    assert ("none_value", None) not in details
+    assert ("empty_value", "") not in details
+    assert ("bool_value", False) in details
+    assert ("int_value", 7) in details
+    assert ("complex_value", "{'x': 1}") in details
+
+
+def test_add_audit_record_uses_relative_path_and_caps_rendered_samples(import_log_clean: Any, tmp_path: Path) -> None:
+    module = import_log_clean
+    records: dict[str, Any] = {}
+    root = tmp_path / "logs"
+    root.mkdir()
+    first = root / "a.log"
+    second = root / "b.log"
+    first.write_text("a", encoding="utf-8")
+    second.write_text("b", encoding="utf-8")
+
+    module._add_audit_record(records, audit_limit=1, cleanup_root=str(root), path=str(first), item_type="file", why="same reason")
+    module._add_audit_record(records, audit_limit=1, cleanup_root=str(root), path=str(second), item_type="file", why="same reason")
+
+    bucket = records["same reason"]
+    assert bucket.total == 2
+    assert [record.real_path for record in bucket.rendered] == ["a.log"]
+
+
+def test_merge_audit_buckets_preserves_total_and_render_cap(import_log_clean: Any, tmp_path: Path) -> None:
+    module = import_log_clean
+    target: dict[str, Any] = {}
+    source: dict[str, Any] = {}
+    root = tmp_path / "logs"
+    root.mkdir()
+    for name in ["one.log", "two.log", "three.log"]:
+        path = root / name
+        path.write_text(name, encoding="utf-8")
+        module._add_audit_record(source, audit_limit=0, cleanup_root=str(root), path=str(path), item_type="file", why="reason")
+
+    module._merge_audit_buckets(target, source, audit_limit=2)
+
+    assert target["reason"].total == 3
+    assert len(target["reason"].rendered) == 2
+
+
+def test_log_audit_list_caps_delete_mode_and_disables_cap_for_report_only(
+    import_log_clean: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = import_log_clean
+    records: dict[str, Any] = {}
+    root = tmp_path / "logs"
+    root.mkdir()
+    for index in range(3):
+        path = root / f"{index}.log"
+        path.write_text("x", encoding="utf-8")
+        module._add_audit_record(records, audit_limit=0, cleanup_root=str(root), path=str(path), item_type="file", why="old")
+
+    captured: list[str] = []
+
+    def capture_info(fmt: str, *args: Any, **_kwargs: Any) -> None:
+        captured.append(fmt % args)
+
+    monkeypatch.setattr(module.LOGGER, "info", capture_info)
+
+    module._log_audit_list("12", "Deleted Items", records, evaluation_epoch=time.time(), delete_log_cap=2)
+    module._log_audit_list("12", "Candidate Items", records, evaluation_epoch=time.time(), delete_log_cap=0)
+
+    assert "rendered_items=2" in captured[0]
+    assert "capped_items=1" in captured[0]
+    assert "DELETE_LOG_CAP=2" in captured[0]
+    assert "rendered_items=3" in captured[1]
+    assert "capped_items=0" in captured[1]
+    assert "DELETE_LOG_CAP=disabled" in captured[1]
+
+
+def test_resolve_top_level_targets_tracks_directory_file_symlink_and_deny_list(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
     (tmp_path / "scheduler").mkdir()
     (tmp_path / "worker").mkdir()
     (tmp_path / "triggerer").mkdir()
+    (tmp_path / "top-level.log").write_text("x", encoding="utf-8")
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / "linked-dir").symlink_to(external, target_is_directory=True)
 
     included, excluded = module._resolve_top_level_targets(
         base_log_folder=str(tmp_path),
@@ -125,36 +230,107 @@ def test_resolve_top_level_targets_tracks_included_and_excluded(import_log_clean
     )
 
     assert [item.label for item in included] == ["scheduler", "triggerer"]
-    assert [item.label for item in excluded] == ["worker"]
+    excluded_by_label = {item.label: item for item in excluded}
+    assert excluded_by_label["worker"].reason == "Excluded by TARGET_DENY_LIST"
+    assert excluded_by_label["linked-dir"].item_type == "symlink"
+    assert excluded_by_label["top-level.log"].item_type == "file"
 
 
-def test_build_settings_parses_variables_and_runtime_flags(
+@pytest.mark.parametrize("base_root", ["relative/path", "/", "/tmp", "/var/log"])
+def test_build_settings_rejects_unsafe_base_roots(
+    import_log_clean: Any,
+    airflow_stub_modules: dict[str, Any],
+    base_root: str,
+) -> None:
+    module = import_log_clean
+    airflow_stub_modules["conf"].values[("logging", "base_log_folder")] = base_root
+    airflow_stub_modules["Variable"].values = {
+        module.MAX_LOG_AGE_VARIABLE_KEY: "30",
+        module.DELETE_LOG_CAP_VARIABLE_KEY: "10",
+    }
+
+    with pytest.raises(module.AirflowSkipException, match="logging.base_log_folder"):
+        module._build_settings({"dry_run": False})
+
+
+def test_build_settings_aggregates_multiple_invalid_runtime_values(
     import_log_clean: Any,
     airflow_stub_modules: dict[str, Any],
     tmp_path: Path,
 ) -> None:
     module = import_log_clean
     (tmp_path / "scheduler").mkdir()
+    airflow_stub_modules["conf"].values[("logging", "base_log_folder")] = str(tmp_path)
+    airflow_stub_modules["Variable"].values = {
+        module.MAX_LOG_AGE_VARIABLE_KEY: "0",
+        module.DELETE_LOG_CAP_VARIABLE_KEY: "0",
+    }
+
+    with pytest.raises(module.AirflowSkipException) as exc_info:
+        module._build_settings({"dry_run": False})
+
+    message = str(exc_info.value)
+    assert module.MAX_LOG_AGE_VARIABLE_KEY in message
+    assert module.DELETE_LOG_CAP_VARIABLE_KEY in message
+
+
+def test_build_settings_accepts_delete_log_cap_zero_in_dry_run(
+    import_log_clean: Any,
+    airflow_stub_modules: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    module = import_log_clean
+    (tmp_path / "scheduler").mkdir()
+    airflow_stub_modules["conf"].values[("logging", "base_log_folder")] = str(tmp_path)
+    airflow_stub_modules["Variable"].values = {
+        module.MAX_LOG_AGE_VARIABLE_KEY: "30",
+        module.DELETE_LOG_CAP_VARIABLE_KEY: "0",
+    }
+
+    settings = module._build_settings({"dry_run": True})
+
+    assert settings.effective_delete_mode == "report-only"
+    assert settings.delete_log_cap == 0
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "expected_mode", "expected_cap"),
+    [
+        (True, "report-only", 0),
+        ("true", "report-only", 0),
+        (False, "delete", 7),
+        ("false", "delete", 7),
+    ],
+)
+def test_build_settings_parameter_variations(
+    import_log_clean: Any,
+    airflow_stub_modules: dict[str, Any],
+    tmp_path: Path,
+    dry_run: bool | str,
+    expected_mode: str,
+    expected_cap: int,
+) -> None:
+    module = import_log_clean
+    (tmp_path / "scheduler").mkdir()
     (tmp_path / "worker").mkdir()
     airflow_stub_modules["conf"].values[("logging", "base_log_folder")] = str(tmp_path)
     airflow_stub_modules["Variable"].values = {
-        module.TARGET_DENY_LIST_VARIABLE_KEY: "worker,bad/name",
         module.MAX_LOG_AGE_VARIABLE_KEY: "45",
+        module.TARGET_DENY_LIST_VARIABLE_KEY: "worker,bad/name, worker",
+        module.DELETE_LOG_CAP_VARIABLE_KEY: "7",
     }
 
-    settings = module._build_settings({"dry_run": "true"})
+    settings = module._build_settings({"dry_run": dry_run})
 
-    assert settings.base_log_folder == str(tmp_path)
     assert settings.target_deny_list == ["worker"]
     assert settings.invalid_target_deny_list == ["bad/name"]
     assert settings.max_log_age_days == 45
-    assert settings.dry_run is True
-    assert settings.effective_delete_mode == "report-only"
-    assert [item.label for item in settings.included_targets] == ["scheduler"]
-    assert [item.label for item in settings.excluded_targets] == ["worker"]
+    assert settings.dry_run is (str(dry_run).strip().lower() == "true" if isinstance(dry_run, str) else dry_run)
+    assert settings.effective_delete_mode == expected_mode
+    assert settings.delete_log_cap == expected_cap
 
 
-def test_scan_cleanup_target_classifies_old_new_and_non_regular_files(
+def test_scan_cleanup_target_classifies_old_young_symlink_and_cross_device_entries(
     import_log_clean: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -162,98 +338,85 @@ def test_scan_cleanup_target_classifies_old_new_and_non_regular_files(
     module = import_log_clean
     root = tmp_path / "scheduler"
     root.mkdir()
-
     old_file = root / "old.log"
+    young_file = root / "young.log"
+    cross_device_file = root / "cross.log"
     old_file.write_text("old", encoding="utf-8")
+    young_file.write_text("young", encoding="utf-8")
+    cross_device_file.write_text("cross", encoding="utf-8")
     set_mtime(old_file, age_days=5)
-
-    new_file = root / "new.log"
-    new_file.write_text("new", encoding="utf-8")
-    set_mtime(new_file, age_days=1)
-
+    set_mtime(young_file, age_days=1)
+    set_mtime(cross_device_file, age_days=5)
     symlink_path = root / "current.log"
-    symlink_path.symlink_to(new_file)
+    symlink_path.symlink_to(young_file)
 
-    force_same_device_stats(monkeypatch, root)
+    original_stat = Path.stat
+    root_device = original_stat(root, follow_symlinks=False).st_dev
+
+    def patched_stat(self: Path, *, follow_symlinks: bool = True) -> Any:
+        stat_result = original_stat(self, follow_symlinks=follow_symlinks)
+        device = root_device + 99 if self == cross_device_file else root_device
+        if self == root or root in self.parents:
+            return SimpleNamespace(
+                st_mode=stat_result.st_mode,
+                st_ino=stat_result.st_ino,
+                st_dev=device,
+                st_size=stat_result.st_size,
+                st_mtime_ns=stat_result.st_mtime_ns,
+                st_mtime=stat_result.st_mtime,
+            )
+        return stat_result
+
+    monkeypatch.setattr(Path, "stat", patched_stat)
 
     result = module._scan_cleanup_target(
         root,
         max_age_days=2,
         report_root=str(tmp_path),
+        evaluation_epoch=time.time(),
+        audit_limit=0,
     )
 
-    summary = result.stats
-    assert [candidate.path for candidate in result.old_files] == [str(old_file)]
-    assert result.old_files[0].size_bytes == old_file.stat().st_size
-    assert result.old_files[0].inode == old_file.stat().st_ino
-    assert summary.directories_visited == 1
-    assert summary.files_scanned_regular == 2
-    assert summary.files_skipped_non_regular == 1
-    assert summary.candidate_file_total_size_bytes == old_file.stat().st_size
-    assert any(record.why == "entry is not a regular file" for record in result.excluded_records)
-
-    age_records = [record for record in result.excluded_records if record.why == "regular file age is not above threshold 2d"]
-    assert len(age_records) == 1
-    assert age_records[0].real_path == "scheduler/new.log"
-    assert age_records[0].detail.startswith("age_days=")
-    assert "threshold_days=2" in age_records[0].detail
+    excluded = rendered_records(result.excluded_records)
+    assert [Path(candidate.path).name for candidate in result.old_files] == ["old.log"]
+    assert result.stats.files_scanned_regular == 2
+    assert result.stats.files_skipped_non_regular == 1
+    assert result.stats.files_skipped_cross_device == 1
+    assert any(record.why == "entry is not a regular file" for record in excluded)
+    assert any(record.why == "file is on a different filesystem" for record in excluded)
+    assert any(record.why == "regular file age is not above threshold 2d" for record in excluded)
 
 
-def test_collect_empty_directories_returns_deepest_first(import_log_clean: Any, tmp_path: Path) -> None:
+def test_collect_empty_directories_handles_ignored_files_and_blocking_entries(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
     root = tmp_path / "scheduler"
-    (root / "keep" / "nested").mkdir(parents=True)
-    (root / "remove" / "deep").mkdir(parents=True)
-    (root / "keep" / "nested" / "data.log").write_text("x", encoding="utf-8")
+    removable = root / "will-empty"
+    blocked = root / "blocked"
+    removable.mkdir(parents=True)
+    blocked.mkdir(parents=True)
+    removable_file = removable / "old.log"
+    blocked_file = blocked / "keep.log"
+    removable_file.write_text("old", encoding="utf-8")
+    blocked_file.write_text("keep", encoding="utf-8")
 
     result = module._collect_empty_directories(
         root,
         report_root=str(root),
+        audit_limit=0,
+        ignored_regular_files={str(removable_file)},
     )
 
-    assert result.empty_directories == [
-        str(root / "remove" / "deep"),
-        str(root / "remove"),
-    ]
-    assert result.excluded_records == []
+    assert [candidate.path for candidate in result.empty_directories] == [str(removable)]
+    assert blocked not in [Path(candidate.path) for candidate in result.empty_directories]
 
 
-def test_collect_empty_directories_keeps_parent_when_subtree_contains_file(
-    import_log_clean: Any,
-    tmp_path: Path,
-) -> None:
-    module = import_log_clean
-    root = tmp_path / "scheduler"
-    (root / "parent" / "child" / "grandchild").mkdir(parents=True)
-    (root / "parent" / "keep.log").write_text("x", encoding="utf-8")
-
-    result = module._collect_empty_directories(
-        root,
-        report_root=str(root),
-    )
-
-    assert result.empty_directories == [
-        str(root / "parent" / "child" / "grandchild"),
-        str(root / "parent" / "child"),
-    ]
-
-
-def test_delete_files_removes_targets_and_reports_bytes(import_log_clean: Any, tmp_path: Path) -> None:
+def test_delete_files_removes_matching_candidate_and_reports_bytes(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
     target = tmp_path / "old.log"
     target.write_text("abcdef", encoding="utf-8")
     set_mtime(target, age_days=10)
 
-    stat_result = target.stat(follow_symlinks=False)
-    candidate = module.FileCandidate(
-        path=str(target),
-        device=int(stat_result.st_dev),
-        inode=int(stat_result.st_ino),
-        mtime=float(stat_result.st_mtime),
-        size_bytes=int(stat_result.st_size),
-    )
-
-    result = module._delete_files([candidate], report_root=str(tmp_path))
+    result = module._delete_files([file_candidate(module, target)], report_root=str(tmp_path), audit_limit=10)
 
     assert result.deleted == 1
     assert result.deleted_bytes == 6
@@ -261,118 +424,62 @@ def test_delete_files_removes_targets_and_reports_bytes(import_log_clean: Any, t
     assert len(result.deleted_records) == 1
 
 
-def test_delete_directories_removes_empty_targets(import_log_clean: Any, tmp_path: Path) -> None:
+def test_delete_files_skips_candidate_changed_after_scan(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
-    target = tmp_path / "empty"
-    target.mkdir()
+    target = tmp_path / "old.log"
+    target.write_text("old", encoding="utf-8")
+    candidate = file_candidate(module, target)
+    time.sleep(0.001)
+    target.write_text("changed-size", encoding="utf-8")
 
-    result = module._delete_directories([str(target)], report_root=str(tmp_path))
+    result = module._delete_files([candidate], report_root=str(tmp_path), audit_limit=10)
 
-    assert result.deleted == 1
-    assert not target.exists()
+    skipped = rendered_records(result.skipped_records)
+    assert result.deleted == 0
+    assert target.exists()
+    assert any(record.why == "delete skipped because candidate changed after scan" for record in skipped)
 
 
-def test_lock_helpers_are_exclusive(import_log_clean: Any, tmp_path: Path) -> None:
+def test_delete_files_skips_disappeared_candidate(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
-    lock_path = tmp_path / "cleanup.lock"
+    target = tmp_path / "old.log"
+    target.write_text("old", encoding="utf-8")
+    candidate = file_candidate(module, target)
+    target.unlink()
 
-    assert module._try_create_lock(lock_path) is True
-    assert module._try_create_lock(lock_path) is False
-    module._remove_lock(lock_path)
-    assert not lock_path.exists()
+    result = module._delete_files([candidate], report_root=str(tmp_path), audit_limit=10)
+
+    skipped = rendered_records(result.skipped_records)
+    assert result.deleted == 0
+    assert any(record.why == "delete skipped because file disappeared before deletion" for record in skipped)
 
 
-def test_root_scan_summary_rows_include_decision_metadata_when_skip_counters_exist(import_log_clean: Any) -> None:
+def test_delete_directories_removes_deepest_first_candidates(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
-    totals = module.RunTotals(
-        roots_processed=1,
-        directories_visited=2,
-        directory_entries_seen=3,
-        file_entries_seen=4,
-        files_scanned_regular=5,
-        regular_file_total_size_bytes=6,
-        candidate_file_total_size_bytes=7,
-        old_file_candidates=1,
-        empty_dir_candidates=0,
-        directories_skipped_inaccessible=2,
-        files_skipped_non_regular=1,
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+
+    result = module._delete_directories(
+        [dir_candidate(module, parent), dir_candidate(module, child)],
+        report_root=str(tmp_path),
+        audit_limit=10,
     )
 
-    rows = module._root_scan_summary_rows(totals)
-    by_name = {row[0]: row for row in rows}
-
-    assert by_name["directories_skipped_inaccessible"][2:] == ["skipped", "Directory metadata unreadable during traversal"]
-    assert by_name["files_skipped_non_regular"][2:] == ["skipped", "Entry is not a regular file"]
-    assert by_name["roots_processed"][2:] == ["", ""]
+    assert result.deleted == 2
+    assert not parent.exists()
 
 
-def test_execute_cleanup_smoke_dry_run_returns_completed_and_keeps_files(
-    import_log_clean: Any,
-    airflow_stub_modules: dict[str, Any],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_delete_directories_skips_non_empty_candidate(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
-    scheduler_root = tmp_path / "scheduler"
-    denied_root = tmp_path / "worker"
-    scheduler_root.mkdir()
-    denied_root.mkdir()
+    target = tmp_path / "not-empty"
+    target.mkdir()
+    candidate = dir_candidate(module, target)
+    (target / "keep.log").write_text("x", encoding="utf-8")
 
-    old_file = scheduler_root / "old.log"
-    old_file.write_text("obsolete", encoding="utf-8")
-    set_mtime(old_file, age_days=4)
+    result = module._delete_directories([candidate], report_root=str(tmp_path), audit_limit=10)
 
-    recent_file = scheduler_root / "recent.log"
-    recent_file.write_text("fresh", encoding="utf-8")
-    set_mtime(recent_file, age_days=1)
-
-    airflow_stub_modules["conf"].values[("logging", "base_log_folder")] = str(tmp_path)
-    airflow_stub_modules["Variable"].values = {
-        module.MAX_LOG_AGE_VARIABLE_KEY: "2",
-        module.TARGET_DENY_LIST_VARIABLE_KEY: "worker",
-    }
-    airflow_stub_modules["current_context"]["params"] = {"dry_run": True}
-
-    logged_sections: list[tuple[str, str, Any]] = []
-
-    force_same_device_stats(monkeypatch, scheduler_root)
-
-    monkeypatch.setattr(module, "_log_section", lambda number, title, rows: logged_sections.append((number, title, rows)))
-    monkeypatch.setattr(module, "_log_info_table", lambda number, title, headers, rows: logged_sections.append((number, title, rows)))
-    monkeypatch.setattr(module, "_log_audit_list", lambda number, title, records: logged_sections.append((number, title, records)))
-
-    result = module.execute_cleanup()
-
-    assert result["status"] == "completed"
-    assert result["roots_processed"] == 1
-    assert result["old_file_candidates"] == 1
-    assert result["files_deleted"] == 0
-    assert result["empty_dirs_deleted"] == 0
-    assert old_file.exists()
-    assert any(title == "Overall Outcome" for _, title, _ in logged_sections)
-
-
-def test_execute_cleanup_returns_skipped_locked_when_lock_exists(
-    import_log_clean: Any,
-    airflow_stub_modules: dict[str, Any],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = import_log_clean
-    (tmp_path / "scheduler").mkdir()
-    airflow_stub_modules["conf"].values[("logging", "base_log_folder")] = str(tmp_path)
-    airflow_stub_modules["Variable"].values = {
-        module.MAX_LOG_AGE_VARIABLE_KEY: "2",
-        module.TARGET_DENY_LIST_VARIABLE_KEY: "",
-    }
-
-    monkeypatch.setattr(module, "_try_create_lock", lambda _path: False)
-    monkeypatch.setattr(module, "_log_section", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module, "_log_info_table", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module, "_log_audit_list", lambda *args, **kwargs: None)
-
-    result = module.execute_cleanup()
-
-    assert result["status"] == "skipped_locked"
-    assert result["roots_processed"] == 0
-    assert result["files_deleted"] == 0
+    skipped = rendered_records(result.skipped_records)
+    assert result.deleted == 0
+    assert target.exists()
+    assert any(record.why == "delete skipped because directory was not empty at rmdir time" for record in skipped)
