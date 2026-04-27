@@ -56,19 +56,17 @@ __version__ = "2.10"
 DAG_ID = "airflow_log_cleanup"
 START_DATE = pendulum.datetime(2024, 1, 1, tz="Europe/Prague")
 SCHEDULE = "@daily"
-DAG_OWNER_NAME = "operations"
+DAG_OWNER_NAME = "operations,maintenance"
 ALERT_EMAIL_ADDRESSES: list[str] = []
-
 DELETE_ENABLED = True
 # Worker-local lock. This prevents same-host cleanup collisions.
-
 LOCK_FILE_PATH = "/tmp/airflow_log_cleanup.lock"
 MAX_LOG_AGE_VARIABLE_KEY = "MAX_LOG_AGE_DAYS"
 TARGET_DENY_LIST_VARIABLE_KEY = "TARGET_DENY_LIST"
 DELETE_LOG_CAP_VARIABLE_KEY = "DELETE_LOG_CAP"
 SECONDS_PER_DAY = 86_400
 PROGRESS_LOG_INTERVAL_SECONDS = 10
-TASK_EXECUTION_TIMEOUT = timedelta(minutes=18)
+TASK_EXECUTION_TIMEOUT = timedelta(minutes=5)
 
 TAGS = [
     f"ver: {__version__}",
@@ -85,6 +83,7 @@ SECTION_WIDTHS: dict[str, list[int]] = {
     "00": [30, 50],
     "01": [10, 44, 22, 36, 72],
     "02": [10, 44, 22, 36, 72],
+    "03": [30, 125],
     "04": [10, 18, 34, 110],
     "05": [36, 18, 12, 55],
     "06": [40, 26],
@@ -450,12 +449,12 @@ class ScanResult:
     excluded_records: AuditBuckets
 
 
-def _coerce_positive_int(value: Any, *, field_name: str) -> int:
+def _coerce_positive_int(value: Any, *, field_name: str, zero_is_skip: bool = True) -> int:
     """Coerce an Airflow Variable value into a strictly positive integer.
 
-    Retention set to zero is intentionally rejected by skipping the task because
-    it would make nearly all existing regular files eligible for cleanup.
-    Negative and malformed values remain hard configuration errors.
+    ``zero_is_skip=True`` preserves retention safety for ``MAX_LOG_AGE_DAYS``.
+    ``zero_is_skip=False`` rejects non-retention controls such as
+    ``DELETE_LOG_CAP`` as configuration errors. No artificial maximum is applied.
     """
 
     if isinstance(value, bool):
@@ -467,15 +466,16 @@ def _coerce_positive_int(value: Any, *, field_name: str) -> int:
         raise ValueError(f"{field_name} must be a positive integer, got {value!r}.") from exc
 
     if parsed == 0:
-        message = f"{field_name}=0 is unsafe for log cleanup. Task processing skipped because retention must be greater than 0."
-        LOGGER.error("%s", message)
-        raise AirflowSkipException(message)
+        if zero_is_skip:
+            raise AirflowSkipException(
+                f"{field_name}=0 is unsafe for log cleanup because value must be greater than 0."
+            )
+        raise ValueError(f"{field_name} must be > 0, got 0.")
 
     if parsed < 0:
         raise ValueError(f"{field_name} must be > 0, got {parsed}.")
 
     return parsed
-
 
 def _human_bytes(num_bytes: int) -> str:
     if num_bytes <= 0:
@@ -577,9 +577,15 @@ def _log_table(
     )
 
 
-def _log_section(number: str, title: str, rows: list[tuple[str, Any]]) -> None:
+def _log_section(
+    number: str,
+    title: str,
+    rows: list[tuple[str, Any]],
+    *,
+    level: int = logging.INFO,
+) -> None:
     _log_table(
-        level=logging.INFO,
+        level=level,
         number=number,
         title=title,
         headers=["Field", "Value"],
@@ -962,6 +968,17 @@ def _resolve_top_level_targets(
             )
             continue
 
+        if stat.S_ISREG(child_stat.st_mode):
+            excluded.append(
+                TargetSpec(
+                    label=label,
+                    path=child_path,
+                    reason=("Excluded because top-level root file is outside cleanup target policy; only top-level directories are traversed"),
+                    item_type="file",
+                )
+            )
+            continue
+
         if not stat.S_ISDIR(child_stat.st_mode):
             excluded.append(
                 TargetSpec(
@@ -1000,29 +1017,83 @@ def _resolve_top_level_targets(
 
 
 def _build_settings(params: dict[str, Any]) -> CleanupSettings:
-    raw_dry_run = params.get("dry_run", False)
-    dry_run = raw_dry_run if isinstance(raw_dry_run, bool) else str(raw_dry_run).strip().lower() == "true"
+    config_errors: list[tuple[str, str]] = []
 
-    base_log_folder = _read_logging_path("base_log_folder", required=True)
-    if base_log_folder is None:
-        raise ValueError("logging.base_log_folder is required for log cleanup.")
+    raw_dry_run = params.get("dry_run", False)
+    dry_run = False
+    if isinstance(raw_dry_run, bool):
+        dry_run = raw_dry_run
+    elif isinstance(raw_dry_run, str) and raw_dry_run.strip().lower() in {"true", "false"}:
+        dry_run = raw_dry_run.strip().lower() == "true"
+    else:
+        config_errors.append(
+            (
+                "dry_run",
+                f"dry_run must be a boolean or one of the strings 'true'/'false', got {raw_dry_run!r}.",
+            )
+        )
+
+    base_log_folder: str | None = None
+    try:
+        base_log_folder = _read_logging_path("base_log_folder", required=True)
+        if base_log_folder is None:
+            config_errors.append(
+                (
+                    "logging.base_log_folder",
+                    "logging.base_log_folder is required for log cleanup.",
+                )
+            )
+    except ValueError as exc:
+        config_errors.append(("logging.base_log_folder", str(exc)))
 
     deny_list, invalid_deny_list = _parse_target_name_list(
         Variable.get(TARGET_DENY_LIST_VARIABLE_KEY, default=""),
         field_name=TARGET_DENY_LIST_VARIABLE_KEY,
     )
-    delete_log_cap = _coerce_positive_int(
-        Variable.get(DELETE_LOG_CAP_VARIABLE_KEY, default="10"),
-        field_name=DELETE_LOG_CAP_VARIABLE_KEY,
-    )
-    max_log_age_days = _coerce_positive_int(
-        Variable.get(MAX_LOG_AGE_VARIABLE_KEY, default="30"),
-        field_name=MAX_LOG_AGE_VARIABLE_KEY,
-    )
-    included, excluded = _resolve_top_level_targets(
-        base_log_folder=base_log_folder,
-        target_deny_list=deny_list,
-    )
+
+    delete_log_cap = 1
+    try:
+        delete_log_cap = _coerce_positive_int(
+            Variable.get(DELETE_LOG_CAP_VARIABLE_KEY, default="10"),
+            field_name=DELETE_LOG_CAP_VARIABLE_KEY,
+            zero_is_skip=False,
+        )
+    except (AirflowSkipException, ValueError) as exc:
+        config_errors.append((DELETE_LOG_CAP_VARIABLE_KEY, str(exc)))
+
+    max_log_age_days = 1
+    try:
+        max_log_age_days = _coerce_positive_int(
+            Variable.get(MAX_LOG_AGE_VARIABLE_KEY, default="30"),
+            field_name=MAX_LOG_AGE_VARIABLE_KEY,
+        )
+    except (AirflowSkipException, ValueError) as exc:
+        config_errors.append((MAX_LOG_AGE_VARIABLE_KEY, str(exc)))
+
+    included: list[TargetSpec] = []
+    excluded: list[TargetSpec] = []
+    if base_log_folder is not None:
+        try:
+            included, excluded = _resolve_top_level_targets(
+                base_log_folder=base_log_folder,
+                target_deny_list=deny_list,
+            )
+        except ValueError as exc:
+            config_errors.append(("target_resolution", str(exc)))
+
+    if config_errors:
+        details = "\n".join(f"- {field}: {message}" for field, message in config_errors)
+        raise AirflowSkipException(
+            "Invalid airflow_log_cleanup configuration. Task processing skipped.\n"
+            f"{details}"
+        )
+
+    if base_log_folder is None:
+        raise AirflowSkipException(
+            "Invalid airflow_log_cleanup configuration. Task processing skipped.\n"
+            "- logging.base_log_folder: logging.base_log_folder is required for log cleanup."
+        )
+
     return CleanupSettings(
         base_log_folder=base_log_folder,
         target_deny_list=deny_list,
@@ -1036,7 +1107,6 @@ def _build_settings(params: dict[str, Any]) -> CleanupSettings:
         delete_log_cap=delete_log_cap,
         lock_file_path=LOCK_FILE_PATH,
     )
-
 
 def _scan_cleanup_target(
     root: Path,
@@ -1921,7 +1991,6 @@ def _append_action_audit_records(
                 item_type="file",
                 why=f"deleted because regular file age exceeded {settings.max_log_age_days}d",
                 observed_epoch=record.observed_epoch,
-                details=_audit_details(size_bytes=record.size_bytes),
             )
 
         for record in deleted_dirs.deleted_records:
@@ -2062,11 +2131,25 @@ with DAG(
         execution_timeout=TASK_EXECUTION_TIMEOUT,
     )
     def execute_cleanup() -> dict[str, Any]:
+        task_started = time.monotonic()
         context = get_current_context()
         evaluation_epoch = _resolve_evaluation_epoch(context)
-        settings = _build_settings(context["params"])
 
-        task_started = time.monotonic()
+        try:
+            settings = _build_settings(context["params"])
+        except (AirflowSkipException, ValueError) as exc:
+            _log_section(
+                "03",
+                "Configuration Failure",
+                [
+                    ("status", "failed_configuration"),
+                    ("exception_type", type(exc).__name__),
+                    ("error", str(exc)),
+                    ("duration_seconds", round(time.monotonic() - task_started, 3)),
+                ],
+                level=logging.ERROR,
+            )
+            raise
 
         _log_section(
             "00",
@@ -2101,6 +2184,39 @@ with DAG(
             headers=["Priority", "State", "Source", "Value", "Meaning"],
             rows=_evaluated_state_rows(settings),
         )
+
+        advisory_rows: list[list[Any]] = []
+        for invalid_name in settings.invalid_target_deny_list:
+            advisory_rows.append(
+                [
+                    10,
+                    TARGET_DENY_LIST_VARIABLE_KEY,
+                    "ignored_invalid_top_level_name",
+                    invalid_name,
+                    "Ignored because the value is not a safe top-level folder name.",
+                ]
+            )
+
+        if not settings.included_targets:
+            advisory_rows.append(
+                [
+                    20,
+                    "target_resolution",
+                    "no_included_targets",
+                    settings.base_log_folder,
+                    "No top-level directory under the validated base root is eligible for cleanup.",
+                ]
+            )
+
+        if advisory_rows:
+            _log_table(
+                level=logging.WARNING,
+                number="03",
+                title="Configuration Advisories",
+                headers=["Priority", "Source", "Advisory", "Value", "Meaning"],
+                rows=advisory_rows,
+            )
+
         _log_table(
             level=logging.INFO,
             number="04",
@@ -2161,6 +2277,27 @@ with DAG(
                 path=target.path,
                 item_type=target.item_type,
                 why=target.reason,
+            )
+
+        for invalid_name in settings.invalid_target_deny_list:
+            _add_audit_record(
+                excluded_audit_records,
+                audit_limit=audit_limit,
+                cleanup_root=settings.base_log_folder,
+                path=settings.base_log_folder,
+                item_type="entry",
+                why=("invalid TARGET_DENY_LIST item ignored because it is not a safe top-level folder name"),
+                details=_audit_details(invalid_target_name=invalid_name),
+            )
+
+        if not settings.included_targets:
+            _add_audit_record(
+                excluded_audit_records,
+                audit_limit=audit_limit,
+                cleanup_root=settings.base_log_folder,
+                path=settings.base_log_folder,
+                item_type="directory",
+                why="no included cleanup targets were resolved under validated base root",
             )
 
         try:
