@@ -61,10 +61,11 @@ import os
 import stat
 import textwrap
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeAlias, TypeVar, cast
 
 import pendulum
 from airflow.configuration import conf
