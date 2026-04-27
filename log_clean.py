@@ -467,15 +467,14 @@ def _coerce_positive_int(value: Any, *, field_name: str, zero_is_skip: bool = Tr
 
     if parsed == 0:
         if zero_is_skip:
-            raise AirflowSkipException(
-                f"{field_name}=0 is unsafe for log cleanup because value must be greater than 0."
-            )
+            raise AirflowSkipException(f"{field_name}=0 is unsafe for log cleanup because value must be greater than 0.")
         raise ValueError(f"{field_name} must be > 0, got 0.")
 
     if parsed < 0:
         raise ValueError(f"{field_name} must be > 0, got {parsed}.")
 
     return parsed
+
 
 def _human_bytes(num_bytes: int) -> str:
     if num_bytes <= 0:
@@ -1083,16 +1082,10 @@ def _build_settings(params: dict[str, Any]) -> CleanupSettings:
 
     if config_errors:
         details = "\n".join(f"- {field}: {message}" for field, message in config_errors)
-        raise AirflowSkipException(
-            "Invalid airflow_log_cleanup configuration. Task processing skipped.\n"
-            f"{details}"
-        )
+        raise AirflowSkipException(f"Invalid airflow_log_cleanup configuration. Task processing skipped.\n{details}")
 
     if base_log_folder is None:
-        raise AirflowSkipException(
-            "Invalid airflow_log_cleanup configuration. Task processing skipped.\n"
-            "- logging.base_log_folder: logging.base_log_folder is required for log cleanup."
-        )
+        raise AirflowSkipException("Invalid airflow_log_cleanup configuration. Task processing skipped.\n- logging.base_log_folder: logging.base_log_folder is required for log cleanup.")
 
     return CleanupSettings(
         base_log_folder=base_log_folder,
@@ -1107,6 +1100,7 @@ def _build_settings(params: dict[str, Any]) -> CleanupSettings:
         delete_log_cap=delete_log_cap,
         lock_file_path=LOCK_FILE_PATH,
     )
+
 
 def _scan_cleanup_target(
     root: Path,
