@@ -2253,45 +2253,45 @@ with DAG(
                 )
 
                 if settings.effective_delete_mode == "delete":
-                    for record in deleted_files.deleted_records:
+                    for deleted_file_record in deleted_files.deleted_records:
                         _add_audit_record(
                             action_audit_records,
                             audit_limit=audit_limit,
                             cleanup_root=settings.base_log_folder,
-                            path=record.path,
+                            path=deleted_file_record.path,
                             item_type="file",
                             why=f"deleted because regular file age exceeded {settings.max_log_age_days}d",
-                            observed_epoch=record.observed_epoch,
+                            observed_epoch=deleted_file_record.observed_epoch,
                         )
 
-                    for record in deleted_dirs.deleted_records:
+                    for deleted_directory_record in deleted_dirs.deleted_records:
                         _add_audit_record(
                             action_audit_records,
                             audit_limit=audit_limit,
                             cleanup_root=settings.base_log_folder,
-                            path=record.path,
+                            path=deleted_directory_record.path,
                             item_type="directory",
                             why="deleted because directory was empty during cleanup phase",
-                            observed_epoch=record.observed_epoch,
+                            observed_epoch=deleted_directory_record.observed_epoch,
                         )
                 else:
-                    for candidate in scan_result.old_files:
+                    for file_candidate in scan_result.old_files:
                         _add_audit_record(
                             action_audit_records,
                             audit_limit=audit_limit,
                             cleanup_root=settings.base_log_folder,
-                            path=candidate.path,
+                            path=file_candidate.path,
                             item_type="file",
                             why=f"would delete because regular file age exceeded {settings.max_log_age_days}d",
-                            observed_epoch=float(candidate.mtime),
+                            observed_epoch=float(file_candidate.mtime),
                         )
 
-                    for candidate in empty_dir_result.empty_directories:
+                    for directory_candidate in empty_dir_result.empty_directories:
                         _add_audit_record(
                             action_audit_records,
                             audit_limit=audit_limit,
                             cleanup_root=settings.base_log_folder,
-                            path=candidate.path,
+                            path=directory_candidate.path,
                             item_type="directory",
                             why="would delete because directory would be empty during cleanup phase",
                         )
