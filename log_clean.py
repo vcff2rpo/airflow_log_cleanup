@@ -39,7 +39,6 @@ import os
 import stat
 import textwrap
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -48,7 +47,7 @@ from typing import Any
 import pendulum
 from airflow.configuration import conf
 from airflow.exceptions import AirflowSkipException
-from airflow.sdk import DAG, Variable, get_current_context, task
+from airflow.sdk import DAG, Param, Variable, get_current_context, task
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,9 +60,15 @@ DAG_OWNER_NAME = "operations"
 ALERT_EMAIL_ADDRESSES: list[str] = []
 
 DELETE_ENABLED = True
+# Worker-local lock. This prevents same-host cleanup collisions.
+
 LOCK_FILE_PATH = "/tmp/airflow_log_cleanup.lock"
 MAX_LOG_AGE_VARIABLE_KEY = "MAX_LOG_AGE_DAYS"
 TARGET_DENY_LIST_VARIABLE_KEY = "TARGET_DENY_LIST"
+DELETE_LOG_CAP_VARIABLE_KEY = "DELETE_LOG_CAP"
+SECONDS_PER_DAY = 86_400
+PROGRESS_LOG_INTERVAL_SECONDS = 10
+TASK_EXECUTION_TIMEOUT = timedelta(minutes=18)
 
 TAGS = [
     f"ver: {__version__}",
@@ -139,7 +144,12 @@ class CleanupSettings:
     dry_run: bool
     effective_delete_mode: str
     delete_enabled: bool
+    delete_log_cap: int
     lock_file_path: str
+
+
+AuditValue = str | int | float | bool
+AuditDetails = tuple[tuple[str, AuditValue], ...]
 
 
 @dataclass(frozen=True)
@@ -147,14 +157,48 @@ class AuditRecord:
     """One operator-facing audit line item.
 
     ``why`` is intentionally stable so audit records group cleanly.
-    Variable per-record values belong in ``detail``.
+    Variable per-record values belong in structured ``details``.
     """
 
     item_type: str
     real_path: str
     why: str
     observed_epoch: float = 0.0
-    detail: str = ""
+    details: AuditDetails = ()
+
+
+AuditRecordKey = tuple[str, str, str, float, AuditDetails]
+
+
+@dataclass
+class AuditBucket:
+    """Bounded audit collector for one audit reason group.
+
+    ``total`` keeps the exact number of records observed for the reason group.
+    ``rendered`` keeps only a capped deduplicated sample for log output.
+    """
+
+    total: int = 0
+    rendered: list[AuditRecord] = field(default_factory=list)
+    _rendered_keys: set[AuditRecordKey] = field(default_factory=set, repr=False)
+
+    def add(self, record: AuditRecord, *, limit: int) -> None:
+        self.total += 1
+        self.add_rendered_sample(record, limit=limit)
+
+    def add_rendered_sample(self, record: AuditRecord, *, limit: int) -> None:
+        if len(self.rendered) >= max(1, limit):
+            return
+
+        key = _audit_record_key(record)
+        if key in self._rendered_keys:
+            return
+
+        self._rendered_keys.add(key)
+        self.rendered.append(record)
+
+
+AuditBuckets = dict[str, AuditBucket]
 
 
 @dataclass(frozen=True)
@@ -169,54 +213,79 @@ class SummaryMetric:
 
 
 SUMMARY_METRICS: tuple[SummaryMetric, ...] = (
-    SummaryMetric("roots_processed", "roots_processed"),
-    SummaryMetric("directories_visited", "directories_visited"),
-    SummaryMetric("directory_entries_seen", "directory_entries_seen"),
-    SummaryMetric("file_entries_seen", "file_entries_seen"),
-    SummaryMetric("files_scanned_regular", "files_scanned_regular"),
-    SummaryMetric("regular_file_total_size", "regular_file_total_size_bytes", human_bytes=True),
-    SummaryMetric("old_file_candidates", "old_file_candidates"),
     SummaryMetric(
-        "old_file_candidate_total_size",
-        "candidate_file_total_size_bytes",
+        summary_item="roots_processed",
+        attr_name="roots_processed",
+    ),
+    SummaryMetric(
+        summary_item="directories_visited",
+        attr_name="directories_visited",
+    ),
+    SummaryMetric(
+        summary_item="directory_entries_seen",
+        attr_name="directory_entries_seen",
+    ),
+    SummaryMetric(
+        summary_item="file_entries_seen",
+        attr_name="file_entries_seen",
+    ),
+    SummaryMetric(
+        summary_item="files_scanned_regular",
+        attr_name="files_scanned_regular",
+    ),
+    SummaryMetric(
+        summary_item="regular_file_total_size",
+        attr_name="regular_file_total_size_bytes",
         human_bytes=True,
     ),
-    SummaryMetric("empty_dir_candidates", "empty_dir_candidates"),
     SummaryMetric(
-        "directories_skipped_inaccessible",
-        "directories_skipped_inaccessible",
-        "skipped",
-        "Directory metadata unreadable during traversal",
+        summary_item="old_file_candidates",
+        attr_name="old_file_candidates",
     ),
     SummaryMetric(
-        "directories_skipped_not_directory",
-        "directories_skipped_not_directory",
-        "skipped",
-        "Entry is not a traversable directory",
+        summary_item="old_file_candidate_total_size",
+        attr_name="candidate_file_total_size_bytes",
+        human_bytes=True,
     ),
     SummaryMetric(
-        "directories_skipped_mount_boundary",
-        "directories_skipped_mount_boundary",
-        "skipped",
-        "Directory is on a different filesystem",
+        summary_item="empty_dir_candidates",
+        attr_name="empty_dir_candidates",
     ),
     SummaryMetric(
-        "files_skipped_inaccessible",
-        "files_skipped_inaccessible",
-        "skipped",
-        "File metadata unreadable during evaluation",
+        summary_item="directories_skipped_inaccessible",
+        attr_name="directories_skipped_inaccessible",
+        decision="skipped",
+        evaluation_method="Directory metadata unreadable during traversal",
     ),
     SummaryMetric(
-        "files_skipped_cross_device",
-        "files_skipped_cross_device",
-        "skipped",
-        "File is on a different filesystem",
+        summary_item="directories_skipped_not_directory",
+        attr_name="directories_skipped_not_directory",
+        decision="skipped",
+        evaluation_method="Entry is not a traversable directory",
     ),
     SummaryMetric(
-        "files_skipped_non_regular",
-        "files_skipped_non_regular",
-        "skipped",
-        "Entry is not a regular file",
+        summary_item="directories_skipped_mount_boundary",
+        attr_name="directories_skipped_mount_boundary",
+        decision="skipped",
+        evaluation_method="Directory is on a different filesystem",
+    ),
+    SummaryMetric(
+        summary_item="files_skipped_inaccessible",
+        attr_name="files_skipped_inaccessible",
+        decision="skipped",
+        evaluation_method="File metadata unreadable during evaluation",
+    ),
+    SummaryMetric(
+        summary_item="files_skipped_cross_device",
+        attr_name="files_skipped_cross_device",
+        decision="skipped",
+        evaluation_method="File is on a different filesystem",
+    ),
+    SummaryMetric(
+        summary_item="files_skipped_non_regular",
+        attr_name="files_skipped_non_regular",
+        decision="skipped",
+        evaluation_method="Entry is not a regular file",
     ),
 )
 
@@ -290,8 +359,28 @@ class RunTotals:
 
 
 @dataclass(frozen=True)
+class DeletedFileRecord:
+    """Deleted regular file audit source with explicit field names."""
+
+    path: str
+    observed_epoch: float
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class DeletedDirectoryRecord:
+    """Deleted empty-directory audit source with explicit field names."""
+
+    path: str
+    observed_epoch: float
+
+
+@dataclass(frozen=True)
 class FileDeleteResult:
     """Result of regular file deletion.
+
+    ``deleted_records`` contains named records instead of positional tuples so
+    action-audit construction remains explicit and type-safe.
 
     ``skipped_records`` contains delete-phase safety skips. These are different
     from scan-phase exclusions because the path was a valid old-file candidate
@@ -301,13 +390,16 @@ class FileDeleteResult:
 
     deleted: int = 0
     deleted_bytes: int = 0
-    deleted_records: tuple[tuple[str, float], ...] = ()
-    skipped_records: tuple[AuditRecord, ...] = ()
+    deleted_records: tuple[DeletedFileRecord, ...] = ()
+    skipped_records: AuditBuckets = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class DirDeleteResult:
     """Result of empty-directory deletion.
+
+    ``deleted_records`` contains named records instead of positional tuples so
+    action-audit construction remains explicit and type-safe.
 
     ``skipped_records`` contains delete-phase directory skips. These explain why
     a directory candidate was not removed after the empty-directory collection
@@ -315,8 +407,8 @@ class DirDeleteResult:
     """
 
     deleted: int = 0
-    deleted_records: tuple[tuple[str, float], ...] = ()
-    skipped_records: tuple[AuditRecord, ...] = ()
+    deleted_records: tuple[DeletedDirectoryRecord, ...] = ()
+    skipped_records: AuditBuckets = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -332,15 +424,21 @@ class FileCandidate:
     device: int
     inode: int
     mtime: float
+    mtime_ns: int
     size_bytes: int
 
 
 @dataclass(frozen=True)
-class EmptyDirCollectResult:
-    """Empty-directory collection result and related audit artifacts."""
+class DirCandidate:
+    path: str
+    device: int
+    inode: int
 
-    empty_directories: list[str] = field(default_factory=list)
-    excluded_records: list[AuditRecord] = field(default_factory=list)
+
+@dataclass(frozen=True)
+class EmptyDirCollectResult:
+    empty_directories: list[DirCandidate] = field(default_factory=list)
+    excluded_records: AuditBuckets = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -349,11 +447,7 @@ class ScanResult:
 
     stats: ScanStats
     old_files: list[FileCandidate]
-    excluded_records: list[AuditRecord]
-
-
-def _as_bool(value: Any) -> bool:
-    return value if isinstance(value, bool) else str(value).strip().lower() == "true"
+    excluded_records: AuditBuckets
 
 
 def _coerce_positive_int(value: Any, *, field_name: str) -> int:
@@ -391,6 +485,26 @@ def _human_bytes(num_bytes: int) -> str:
         value /= 1024.0
         index += 1
     return f"{int(value)} {units[index]}" if index == 0 else f"{value:.2f} {units[index]}"
+
+
+def _resolve_evaluation_epoch(context: dict[str, Any]) -> float:
+    """Return one stable epoch used for age evaluation and audit rendering.
+
+    Prefer the DAG run start timestamp because it remains stable across task
+    retries for the same DAG run. Fall back to wall-clock time when the runtime
+    context does not provide a usable DAG run timestamp.
+    """
+
+    dag_run = context.get("dag_run")
+    dag_run_start = getattr(dag_run, "start_date", None)
+
+    if dag_run_start is not None:
+        try:
+            return float(dag_run_start.timestamp())
+        except (AttributeError, TypeError, ValueError, OSError):
+            LOGGER.warning("Unable to derive evaluation epoch from dag_run.start_date; falling back to current wall-clock time.")
+
+    return time.time()
 
 
 def _normalize_text(value: Any) -> str:
@@ -447,24 +561,30 @@ def _render_table(headers: list[str], rows: list[list[Any]], widths: list[int]) 
     return "\n".join(rendered)
 
 
-def _log_block(level: str, number: str, title: str, body: str) -> None:
-    (LOGGER.warning if level == "warning" else LOGGER.info)("%s", f"{_section_title(number, title)}\n{body}\n\n")
-
-
-def _log_table(level: str, number: str, title: str, headers: list[str], rows: list[list[Any]]) -> None:
-    _log_block(level, number, title, _render_table(headers, rows, _section_widths(number, headers)))
-
-
-def _log_info_table(number: str, title: str, headers: list[str], rows: list[list[Any]]) -> None:
-    _log_table("info", number, title, headers, rows)
-
-
-def _log_warning_table(number: str, title: str, headers: list[str], rows: list[list[Any]]) -> None:
-    _log_table("warning", number, title, headers, rows)
+def _log_table(
+    *,
+    level: int,
+    number: str,
+    title: str,
+    headers: list[str],
+    rows: list[list[Any]],
+) -> None:
+    LOGGER.log(
+        level,
+        "%s\n%s\n\n",
+        _section_title(number, title),
+        _render_table(headers, rows, _section_widths(number, headers)),
+    )
 
 
 def _log_section(number: str, title: str, rows: list[tuple[str, Any]]) -> None:
-    _log_info_table(number, title, ["Field", "Value"], [[key, value] for key, value in rows])
+    _log_table(
+        level=logging.INFO,
+        number=number,
+        title=title,
+        headers=["Field", "Value"],
+        rows=[[key, value] for key, value in rows],
+    )
 
 
 def _validate_cleanup_root(path_value: str) -> str:
@@ -493,7 +613,8 @@ def _is_valid_target_name(name: str) -> bool:
 
 
 def _parse_target_name_list(raw_value: str | None, *, field_name: str) -> tuple[list[str], list[str]]:
-    valid, invalid = set(), []
+    valid: set[str] = set()
+    invalid: list[str] = []
     for item in [] if raw_value is None else str(raw_value).split(","):
         candidate = item.strip()
         if not candidate:
@@ -505,25 +626,6 @@ def _parse_target_name_list(raw_value: str | None, *, field_name: str) -> tuple[
     if invalid:
         LOGGER.warning("Invalid target names ignored for %s: %s", field_name, ", ".join(invalid))
     return sorted(valid), sorted(invalid)
-
-
-def _sort_directories_deepest_first(paths: list[str]) -> list[str]:
-    return sorted(
-        paths,
-        key=lambda item: (
-            -len(Path(item).parts),
-            -len(item),
-            Path(item).name.casefold(),
-            Path(item).name,
-            item,
-        ),
-    )
-
-
-def _sort_file_candidates_shortest_first(candidates: list[FileCandidate]) -> list[FileCandidate]:
-    """Sort file candidates by path length and path for stable reporting/deletion."""
-
-    return sorted(candidates, key=lambda item: (len(item.path), item.path))
 
 
 def _path_identity(path: str | Path) -> str:
@@ -556,44 +658,111 @@ def _relative_path(path_str: str, cleanup_root: str) -> str:
             return path_str
 
 
-def _append_audit_record(
-    records: list[AuditRecord],
+def _audit_details(**values: Any) -> AuditDetails:
+    details: list[tuple[str, AuditValue]] = []
+
+    for key, value in values.items():
+        if value is None or value == "":
+            continue
+
+        if isinstance(value, bool):
+            details.append((key, value))
+        elif isinstance(value, (str, int, float)):
+            details.append((key, value))
+        else:
+            details.append((key, str(value)))
+
+    return tuple(details)
+
+
+def _audit_record_key(record: AuditRecord) -> AuditRecordKey:
+    return (
+        record.item_type,
+        record.real_path,
+        record.why,
+        record.observed_epoch,
+        record.details,
+    )
+
+
+def _new_audit_buckets() -> AuditBuckets:
+    return {}
+
+
+def _make_audit_record(
     *,
     cleanup_root: str,
     path: str,
     item_type: str,
     why: str,
     observed_epoch: float = 0.0,
-    detail: str = "",
-) -> None:
-    records.append(
-        AuditRecord(
-            item_type=item_type,
-            real_path=_relative_path(path, cleanup_root),
-            why=why,
-            observed_epoch=observed_epoch,
-            detail=detail,
-        )
+    details: AuditDetails = (),
+) -> AuditRecord:
+    return AuditRecord(
+        item_type=item_type,
+        real_path=_relative_path(path, cleanup_root),
+        why=why,
+        observed_epoch=observed_epoch,
+        details=details,
     )
 
 
-def _dedupe_audit_records(records: list[AuditRecord]) -> list[AuditRecord]:
-    seen: set[tuple[str, str, str, float, str]] = set()
-    deduped: list[AuditRecord] = []
+def _add_audit_record(
+    records: AuditBuckets,
+    *,
+    audit_limit: int,
+    cleanup_root: str,
+    path: str,
+    item_type: str,
+    why: str,
+    observed_epoch: float = 0.0,
+    details: AuditDetails = (),
+) -> None:
+    record = _make_audit_record(
+        cleanup_root=cleanup_root,
+        path=path,
+        item_type=item_type,
+        why=why,
+        observed_epoch=observed_epoch,
+        details=details,
+    )
+    records.setdefault(record.why, AuditBucket()).add(
+        record,
+        limit=max(1, audit_limit),
+    )
 
-    for record in records:
-        key = (
-            record.item_type,
-            record.real_path,
-            record.why,
-            record.observed_epoch,
-            record.detail,
-        )
-        if key not in seen:
-            seen.add(key)
-            deduped.append(record)
 
-    return deduped
+def _merge_audit_buckets(
+    target: AuditBuckets,
+    source: AuditBuckets,
+    *,
+    audit_limit: int,
+) -> None:
+    render_limit = max(1, audit_limit)
+
+    for reason, source_bucket in source.items():
+        target_bucket = target.setdefault(reason, AuditBucket())
+        target_bucket.total += source_bucket.total
+
+        for record in source_bucket.rendered:
+            target_bucket.add_rendered_sample(record, limit=render_limit)
+
+
+def _audit_total(records: AuditBuckets) -> int:
+    return sum(bucket.total for bucket in records.values())
+
+
+def _audit_detail_number(record: AuditRecord, key_name: str) -> float:
+    for key, value in record.details:
+        if key != key_name:
+            continue
+
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    return float("inf")
 
 
 def _audit_item_type_order(item_type: str) -> int:
@@ -608,102 +777,79 @@ def _audit_item_type_order(item_type: str) -> int:
     return order.get(item_type, 99)
 
 
-def _audit_detail_float(record: AuditRecord, key_name: str) -> float:
-    """Extract a float value from AuditRecord.detail.
+def _directory_path_sort_key(path_value: str) -> tuple[int, int, str, str, str]:
+    """Sort directory paths deepest-first with deterministic name ordering."""
 
-    Expected detail format:
-        age_days=0.38; threshold_days=1
+    path = Path(path_value)
+    return (
+        -len(path.parts),
+        -len(path_value),
+        path.name.casefold(),
+        path.name,
+        path_value,
+    )
 
-    Missing or invalid values are sorted last.
-    """
 
-    for part in record.detail.split(";"):
-        key, separator, value = part.strip().partition("=")
-        if key == key_name and separator:
-            try:
-                return float(value)
-            except ValueError:
-                return float("inf")
+def _directory_audit_record_sort_key(record: AuditRecord) -> tuple[int, int, str, str, str, str]:
+    """Sort directory audit records deepest-first with deterministic detail ordering."""
 
-    return float("inf")
+    return (*_directory_path_sort_key(record.real_path), repr(record.details))
 
 
 def _audit_record_sort_key(record: AuditRecord) -> tuple[int, float, float, int, int, str, str]:
-    """Return deterministic sort key for audit records inside one reason group.
-
-    Regular age-threshold file records sort by item type, then ``age_days``
-    descending, so the oldest files are shown first. Other records sort by item
-    type, observed timestamp, path depth, path length, path, and detail.
-
-    Empty-directory cleanup records are sorted by
-    ``_group_audit_records_by_reason()`` because that ordering is reason-specific
-    and must apply to both dry-run candidates and real delete records.
-    """
+    """Return deterministic sort key for audit records inside one reason group."""
 
     return (
         _audit_item_type_order(record.item_type),
-        -_audit_detail_float(record, "age_days"),
+        -_audit_detail_number(record, "age_days"),
         record.observed_epoch,
         len(Path(record.real_path).parts),
         len(record.real_path),
         record.real_path,
-        record.detail,
+        repr(record.details),
     )
 
 
-def _group_audit_records_by_reason(records: list[AuditRecord]) -> list[tuple[str, list[AuditRecord]]]:
-    """Group audit records by reason and sort each group deterministically.
+def _group_audit_buckets_by_reason(
+    records: AuditBuckets,
+) -> list[tuple[str, int, list[AuditRecord]]]:
+    """Group capped audit samples by reason with exact observed totals."""
 
-    Age-based regular-file records are ordered from oldest to youngest.
+    result: list[tuple[str, int, list[AuditRecord]]] = []
 
-    Empty-directory cleanup records are ordered by deepest path first, then
-    longest path, then directory basename, so leaf directories are displayed
-    before parent directories with deterministic name ordering.
-    """
-
-    grouped: dict[str, list[AuditRecord]] = defaultdict(list)
-
-    for record in _dedupe_audit_records(records):
-        grouped[record.why].append(record)
-
-    result: list[tuple[str, list[AuditRecord]]] = []
-
-    for reason in sorted(grouped):
-        grouped_records = grouped[reason]
+    for reason in sorted(records):
+        bucket = records[reason]
+        grouped_records = bucket.rendered
 
         if reason in {
             "would delete because directory would be empty during cleanup phase",
             "deleted because directory was empty during cleanup phase",
         }:
-            sorted_records = sorted(
-                grouped_records,
-                key=lambda record: (
-                    -len(Path(record.real_path).parts),
-                    -len(record.real_path),
-                    Path(record.real_path).name.casefold(),
-                    Path(record.real_path).name,
-                    record.real_path,
-                    record.detail,
-                ),
-            )
+            sorted_records = sorted(grouped_records, key=_directory_audit_record_sort_key)
         else:
             sorted_records = sorted(grouped_records, key=_audit_record_sort_key)
 
-        result.append((reason, sorted_records))
+        result.append((reason, bucket.total, sorted_records))
 
     return result
 
 
-def _log_audit_list(number: str, title: str, records: list[AuditRecord]) -> None:
-    """Log audit records grouped by reason with one blank line between groups.
+def _log_audit_list(
+    number: str,
+    title: str,
+    records: AuditBuckets,
+    *,
+    evaluation_epoch: float,
+    delete_log_cap: int,
+) -> None:
+    """Log capped audit samples grouped by reason with exact observed totals.
 
-    Audit age is rendered once from ``observed_epoch`` as ``observed_age_days``.
-    Duplicate ``age_days`` values stored in technical detail are suppressed at
-    render time while preserving other useful detail fields, such as
-    ``threshold_days``.
+    ``DELETE_LOG_CAP`` limits rendered item lines per reason group in both
+    dry-run and delete mode. It does not change cleanup logic, deletion
+    decisions, counters, or XCom result values.
     """
 
-    grouped = _group_audit_records_by_reason(records)
+    grouped = _group_audit_buckets_by_reason(records)
 
     if not grouped:
         LOGGER.info("%s\n- none\n\n", _section_title(number, title))
@@ -713,46 +859,39 @@ def _log_audit_list(number: str, title: str, records: list[AuditRecord]) -> None
         grouped = sorted(
             grouped,
             key=lambda item: (
-                0 if item[1] and item[1][0].item_type == "file" else 1,
+                0 if item[2] and item[2][0].item_type == "file" else 1,
                 item[0],
             ),
         )
 
     lines: list[str] = []
     title_prefix = title.lower()
-    now_epoch = time.time()
+    render_limit = max(1, delete_log_cap)
 
-    for group_index, (reason, grouped_records) in enumerate(grouped, start=1):
-        lines.append(f"- {title_prefix} reason: {reason}")
+    for group_index, (reason, group_total, grouped_records) in enumerate(grouped, start=1):
+        rendered_group_records = grouped_records[:render_limit]
+        rendered_count = len(rendered_group_records)
+        capped_count = max(0, group_total - rendered_count)
 
-        for index, record in enumerate(grouped_records, start=1):
+        lines.append(f"- {title_prefix} reason: {reason} | total_items={group_total} | rendered_items={rendered_count} | capped_items={capped_count} | DELETE_LOG_CAP={render_limit}")
+
+        for index, record in enumerate(rendered_group_records, start=1):
             suffix_parts: list[str] = []
 
-            if record.observed_epoch > 0:
-                observed_age_days = max(0.0, now_epoch - record.observed_epoch) / 86_400
+            if record.item_type == "file" and record.observed_epoch > 0:
+                observed_age_days = max(0.0, evaluation_epoch - record.observed_epoch) / SECONDS_PER_DAY
                 suffix_parts.append(f"observed_age_days={observed_age_days:.2f}")
 
-            if record.detail:
-                retained_detail_parts: list[str] = []
+            retained_detail_parts = [f"{key}={value}" for key, value in record.details if key not in {"age_days"}]
 
-                for detail_part in record.detail.split(";"):
-                    normalized_detail_part = detail_part.strip()
-
-                    if not normalized_detail_part:
-                        continue
-
-                    detail_key = normalized_detail_part.partition("=")[0].strip()
-
-                    if detail_key in {"age_days", "size_bytes"}:
-                        continue
-
-                    retained_detail_parts.append(normalized_detail_part)
-
-                if retained_detail_parts:
-                    suffix_parts.append(f"detail={'; '.join(retained_detail_parts)}")
+            if retained_detail_parts:
+                suffix_parts.append(f"detail={'; '.join(retained_detail_parts)}")
 
             suffix = f" | {' | '.join(suffix_parts)}" if suffix_parts else ""
             lines.append(f"  {index}. [{record.item_type}] {record.real_path}{suffix}")
+
+        if capped_count > 0:
+            lines.append(f"  ... capped {capped_count} item(s) by DELETE_LOG_CAP={render_limit}")
 
         if group_index < len(grouped):
             lines.append(" ")
@@ -861,13 +1000,20 @@ def _resolve_top_level_targets(
 
 
 def _build_settings(params: dict[str, Any]) -> CleanupSettings:
-    dry_run = _as_bool(params.get("dry_run", False))
+    raw_dry_run = params.get("dry_run", False)
+    dry_run = raw_dry_run if isinstance(raw_dry_run, bool) else str(raw_dry_run).strip().lower() == "true"
+
     base_log_folder = _read_logging_path("base_log_folder", required=True)
-    assert base_log_folder is not None
+    if base_log_folder is None:
+        raise ValueError("logging.base_log_folder is required for log cleanup.")
 
     deny_list, invalid_deny_list = _parse_target_name_list(
         Variable.get(TARGET_DENY_LIST_VARIABLE_KEY, default=""),
         field_name=TARGET_DENY_LIST_VARIABLE_KEY,
+    )
+    delete_log_cap = _coerce_positive_int(
+        Variable.get(DELETE_LOG_CAP_VARIABLE_KEY, default="10"),
+        field_name=DELETE_LOG_CAP_VARIABLE_KEY,
     )
     max_log_age_days = _coerce_positive_int(
         Variable.get(MAX_LOG_AGE_VARIABLE_KEY, default="30"),
@@ -887,6 +1033,7 @@ def _build_settings(params: dict[str, Any]) -> CleanupSettings:
         dry_run=dry_run,
         effective_delete_mode="report-only" if dry_run or not DELETE_ENABLED else "delete",
         delete_enabled=DELETE_ENABLED,
+        delete_log_cap=delete_log_cap,
         lock_file_path=LOCK_FILE_PATH,
     )
 
@@ -896,6 +1043,8 @@ def _scan_cleanup_target(
     *,
     max_age_days: int,
     report_root: str,
+    evaluation_epoch: float,
+    audit_limit: int,
 ) -> ScanResult:
     """Scan one cleanup target for old regular files.
 
@@ -903,13 +1052,17 @@ def _scan_cleanup_target(
     not follow symlink directories. Unreadable directories, non-directory
     traversal entries, cross-device directories, unreadable files, cross-device
     files, and non-regular files are skipped and audited.
+
+    ``evaluation_epoch`` is resolved once by the task and reused for every
+    target. This keeps age eligibility deterministic inside the run and avoids
+    age drift between scanning and audit rendering.
     """
 
-    now_ts = time.time()
-    retention_threshold_seconds = max_age_days * 86_400
+    last_progress_log = time.monotonic()
+    retention_threshold_seconds = max_age_days * SECONDS_PER_DAY
 
     old_files: list[FileCandidate] = []
-    excluded_records: list[AuditRecord] = []
+    excluded_records: AuditBuckets = _new_audit_buckets()
     stats = ScanStats()
 
     try:
@@ -925,8 +1078,9 @@ def _scan_cleanup_target(
     def walk_error(exc: OSError) -> None:
         error_path = str(exc.filename) if getattr(exc, "filename", None) else str(root)
         stats.directories_skipped_inaccessible += 1
-        _append_audit_record(
+        _add_audit_record(
             excluded_records,
+            audit_limit=audit_limit,
             cleanup_root=report_root,
             path=error_path,
             item_type="directory",
@@ -944,6 +1098,19 @@ def _scan_cleanup_target(
         stats.directory_entries_seen += len(dirnames)
         stats.file_entries_seen += len(filenames)
 
+        progress_now = time.monotonic()
+        if progress_now - last_progress_log >= PROGRESS_LOG_INTERVAL_SECONDS:
+            LOGGER.info(
+                "cleanup_scan_progress target=%s current=%s directories_visited=%d directory_entries_seen=%d file_entries_seen=%d files_scanned_regular=%d",
+                root,
+                current,
+                stats.directories_visited,
+                stats.directory_entries_seen,
+                stats.file_entries_seen,
+                stats.files_scanned_regular,
+            )
+            last_progress_log = progress_now
+
         allowed_dirnames: list[str] = []
 
         for dirname in dirnames:
@@ -953,9 +1120,10 @@ def _scan_cleanup_target(
                 candidate_stat = candidate.stat(follow_symlinks=False)
             except OSError:
                 stats.directories_skipped_inaccessible += 1
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
                     cleanup_root=report_root,
+                    audit_limit=audit_limit,
                     path=str(candidate),
                     item_type="directory",
                     why="directory metadata unreadable during traversal",
@@ -964,9 +1132,10 @@ def _scan_cleanup_target(
 
             if not stat.S_ISDIR(candidate_stat.st_mode):
                 stats.directories_skipped_not_directory += 1
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
                     cleanup_root=report_root,
+                    audit_limit=audit_limit,
                     path=str(candidate),
                     item_type="entry",
                     why="entry is not a traversable directory",
@@ -975,9 +1144,10 @@ def _scan_cleanup_target(
 
             if candidate_stat.st_dev != root_device:
                 stats.directories_skipped_mount_boundary += 1
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
                     cleanup_root=report_root,
+                    audit_limit=audit_limit,
                     path=str(candidate),
                     item_type="directory",
                     why="directory is on a different filesystem",
@@ -995,8 +1165,9 @@ def _scan_cleanup_target(
                 candidate_stat = candidate.stat(follow_symlinks=False)
             except OSError:
                 stats.files_skipped_inaccessible += 1
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
                     path=str(candidate),
                     item_type="file",
@@ -1006,8 +1177,9 @@ def _scan_cleanup_target(
 
             if candidate_stat.st_dev != root_device:
                 stats.files_skipped_cross_device += 1
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
                     path=str(candidate),
                     item_type="file",
@@ -1017,8 +1189,9 @@ def _scan_cleanup_target(
 
             if not stat.S_ISREG(candidate_stat.st_mode):
                 stats.files_skipped_non_regular += 1
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
                     path=str(candidate),
                     item_type="entry",
@@ -1027,21 +1200,25 @@ def _scan_cleanup_target(
                 continue
 
             size_bytes = int(candidate_stat.st_size)
-            file_age_seconds = max(0.0, now_ts - float(candidate_stat.st_mtime))
-            age_days_display = file_age_seconds / 86_400
+            file_age_seconds = max(0.0, evaluation_epoch - float(candidate_stat.st_mtime))
+            age_days_display = file_age_seconds / SECONDS_PER_DAY
 
             stats.files_scanned_regular += 1
             stats.regular_file_total_size_bytes += size_bytes
 
             if file_age_seconds <= retention_threshold_seconds:
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
                     path=str(candidate),
                     item_type="file",
                     why=f"regular file age is not above threshold {max_age_days}d",
                     observed_epoch=float(candidate_stat.st_mtime),
-                    detail=f"age_days={age_days_display:.2f}; threshold_days={max_age_days}",
+                    details=_audit_details(
+                        age_days=round(age_days_display, 2),
+                        threshold_days=max_age_days,
+                    ),
                 )
                 continue
 
@@ -1051,6 +1228,7 @@ def _scan_cleanup_target(
                     device=int(candidate_stat.st_dev),
                     inode=int(candidate_stat.st_ino),
                     mtime=float(candidate_stat.st_mtime),
+                    mtime_ns=int(candidate_stat.st_mtime_ns),
                     size_bytes=size_bytes,
                 )
             )
@@ -1058,7 +1236,7 @@ def _scan_cleanup_target(
 
     return ScanResult(
         stats=stats,
-        old_files=_sort_file_candidates_shortest_first(old_files),
+        old_files=sorted(old_files, key=lambda item: (len(item.path), item.path)),
         excluded_records=excluded_records,
     )
 
@@ -1067,6 +1245,7 @@ def _collect_empty_directories(
     root: Path,
     *,
     report_root: str,
+    audit_limit: int,
     ignored_regular_files: set[str] | None = None,
 ) -> EmptyDirCollectResult:
     """Collect directories that are empty or would become empty.
@@ -1093,15 +1272,16 @@ def _collect_empty_directories(
     root_device = root_stat.st_dev
     ignored_file_keys = {_path_identity(path) for path in ignored_regular_files or set()}
 
-    excluded_records: list[AuditRecord] = []
+    excluded_records: AuditBuckets = _new_audit_buckets()
     discovered_dirs: list[Path] = []
     blocked_directory_keys: set[str] = set()
 
     def walk_error(exc: OSError) -> None:
         error_path = str(exc.filename) if getattr(exc, "filename", None) else str(root)
         blocked_directory_keys.add(_path_identity(error_path))
-        _append_audit_record(
+        _add_audit_record(
             excluded_records,
+            audit_limit=audit_limit,
             cleanup_root=report_root,
             path=error_path,
             item_type="directory",
@@ -1125,8 +1305,9 @@ def _collect_empty_directories(
                 candidate_stat = candidate.stat(follow_symlinks=False)
             except OSError:
                 blocked_directory_keys.add(_path_identity(candidate))
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
                     path=str(candidate),
                     item_type="directory",
@@ -1135,8 +1316,9 @@ def _collect_empty_directories(
                 continue
 
             if not stat.S_ISDIR(candidate_stat.st_mode):
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
                     path=str(candidate),
                     item_type="entry",
@@ -1146,8 +1328,9 @@ def _collect_empty_directories(
 
             if candidate_stat.st_dev != root_device:
                 blocked_directory_keys.add(_path_identity(candidate))
-                _append_audit_record(
+                _add_audit_record(
                     excluded_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
                     path=str(candidate),
                     item_type="directory",
@@ -1159,7 +1342,7 @@ def _collect_empty_directories(
 
         dirnames[:] = allowed_dirnames
 
-    removable_dirs: list[str] = []
+    removable_dirs: list[DirCandidate] = []
     subtree_has_blocking_entry: dict[Path, bool] = {}
 
     for directory in sorted(
@@ -1177,8 +1360,9 @@ def _collect_empty_directories(
             directory_stat = directory.stat(follow_symlinks=False)
         except OSError:
             blocked_directory_keys.add(directory_key)
-            _append_audit_record(
+            _add_audit_record(
                 excluded_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=str(directory),
                 item_type="directory",
@@ -1188,8 +1372,9 @@ def _collect_empty_directories(
             continue
 
         if not stat.S_ISDIR(directory_stat.st_mode):
-            _append_audit_record(
+            _add_audit_record(
                 excluded_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=str(directory),
                 item_type="entry",
@@ -1200,8 +1385,9 @@ def _collect_empty_directories(
 
         if directory_stat.st_dev != root_device:
             blocked_directory_keys.add(directory_key)
-            _append_audit_record(
+            _add_audit_record(
                 excluded_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=str(directory),
                 item_type="directory",
@@ -1220,8 +1406,9 @@ def _collect_empty_directories(
                     child_stat = child.stat(follow_symlinks=False)
                 except OSError:
                     blocked_directory_keys.add(child_key)
-                    _append_audit_record(
+                    _add_audit_record(
                         excluded_records,
+                        audit_limit=audit_limit,
                         cleanup_root=report_root,
                         path=str(child),
                         item_type="entry",
@@ -1242,8 +1429,9 @@ def _collect_empty_directories(
 
         except OSError:
             blocked_directory_keys.add(directory_key)
-            _append_audit_record(
+            _add_audit_record(
                 excluded_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=str(directory),
                 item_type="directory",
@@ -1254,15 +1442,29 @@ def _collect_empty_directories(
         subtree_has_blocking_entry[directory] = has_blocking_entry
 
         if not has_blocking_entry:
-            removable_dirs.append(str(directory))
+            removable_dirs.append(
+                DirCandidate(
+                    path=str(directory),
+                    device=int(directory_stat.st_dev),
+                    inode=int(directory_stat.st_ino),
+                )
+            )
 
     return EmptyDirCollectResult(
-        empty_directories=_sort_directories_deepest_first(removable_dirs),
+        empty_directories=sorted(
+            removable_dirs,
+            key=lambda item: _directory_path_sort_key(item.path),
+        ),
         excluded_records=excluded_records,
     )
 
 
-def _delete_files(candidates: list[FileCandidate], *, report_root: str) -> FileDeleteResult:
+def _delete_files(
+    candidates: list[FileCandidate],
+    *,
+    report_root: str,
+    audit_limit: int,
+) -> FileDeleteResult:
     """Delete scanned regular file candidates after identity revalidation.
 
     A path is deleted only when the current filesystem object still matches the
@@ -1277,23 +1479,37 @@ def _delete_files(candidates: list[FileCandidate], *, report_root: str) -> FileD
 
     deleted = 0
     deleted_bytes = 0
-    deleted_records: list[tuple[str, float]] = []
-    skipped_records: list[AuditRecord] = []
+    deleted_records: list[DeletedFileRecord] = []
+    skipped_records: AuditBuckets = _new_audit_buckets()
 
-    for candidate in candidates:
+    last_progress_log = time.monotonic()
+
+    for index, candidate in enumerate(candidates, start=1):
+        progress_now = time.monotonic()
+        if progress_now - last_progress_log >= PROGRESS_LOG_INTERVAL_SECONDS:
+            LOGGER.info(
+                "cleanup_delete_files_progress processed=%d total=%d deleted=%d skipped=%d",
+                index - 1,
+                len(candidates),
+                deleted,
+                _audit_total(skipped_records),
+            )
+            last_progress_log = progress_now
+
         path = Path(candidate.path)
 
         try:
             current_stat = path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            _append_audit_record(
+        except FileNotFoundError as exc:
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=candidate.path,
                 item_type="file",
                 why="delete skipped because file disappeared before deletion",
                 observed_epoch=candidate.mtime,
-                detail=f"scan_size_bytes={candidate.size_bytes}",
+                details=_audit_details(errno=getattr(exc, "errno", ""), error=str(exc)),
             )
             continue
         except OSError as exc:
@@ -1302,14 +1518,15 @@ def _delete_files(candidates: list[FileCandidate], *, report_root: str) -> FileD
                 path,
                 exc,
             )
-            _append_audit_record(
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=candidate.path,
                 item_type="file",
                 why="delete skipped because file metadata became unreadable",
                 observed_epoch=candidate.mtime,
-                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+                details=_audit_details(errno=getattr(exc, "errno", ""), error=str(exc)),
             )
             continue
 
@@ -1318,27 +1535,28 @@ def _delete_files(candidates: list[FileCandidate], *, report_root: str) -> FileD
                 "Skipping file deletion candidate because it is not a regular file: %s",
                 path,
             )
-            _append_audit_record(
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=candidate.path,
                 item_type="entry",
                 why="delete skipped because candidate is no longer a regular file",
                 observed_epoch=float(current_stat.st_mtime),
-                detail=f"mode={oct(stat.S_IMODE(current_stat.st_mode))}",
+                details=_audit_details(mode=oct(stat.S_IMODE(current_stat.st_mode))),
             )
             continue
 
         current_identity = (
             int(current_stat.st_dev),
             int(current_stat.st_ino),
-            float(current_stat.st_mtime),
+            int(current_stat.st_mtime_ns),
             int(current_stat.st_size),
         )
         expected_identity = (
             candidate.device,
             candidate.inode,
-            candidate.mtime,
+            candidate.mtime_ns,
             candidate.size_bytes,
         )
 
@@ -1347,139 +1565,208 @@ def _delete_files(candidates: list[FileCandidate], *, report_root: str) -> FileD
                 "Skipping file deletion candidate because it changed after scan: %s",
                 path,
             )
-            _append_audit_record(
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=candidate.path,
                 item_type="file",
                 why="delete skipped because candidate changed after scan",
                 observed_epoch=float(current_stat.st_mtime),
-                detail=(
-                    f"scan_device={candidate.device}; "
-                    f"scan_inode={candidate.inode}; "
-                    f"scan_size_bytes={candidate.size_bytes}; "
-                    f"current_device={int(current_stat.st_dev)}; "
-                    f"current_inode={int(current_stat.st_ino)}; "
-                    f"current_size_bytes={int(current_stat.st_size)}"
+                details=_audit_details(
+                    scan_device=candidate.device,
+                    scan_inode=candidate.inode,
+                    scan_size_bytes=candidate.size_bytes,
+                    current_device=int(current_stat.st_dev),
+                    current_inode=int(current_stat.st_ino),
+                    current_size_bytes=int(current_stat.st_size),
                 ),
             )
             continue
 
         try:
             path.unlink()
-        except FileNotFoundError:
-            _append_audit_record(
+        except FileNotFoundError as exc:
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=candidate.path,
                 item_type="file",
                 why="delete skipped because file disappeared before unlink",
                 observed_epoch=candidate.mtime,
-                detail=f"scan_size_bytes={candidate.size_bytes}",
+                details=_audit_details(
+                    errno=getattr(exc, "errno", ""),
+                    error=str(exc),
+                    scan_size_bytes=candidate.size_bytes,
+                ),
             )
             continue
         except OSError as exc:
             LOGGER.warning("Failed deleting file candidate: %s: %s", path, exc)
-            _append_audit_record(
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
                 path=candidate.path,
                 item_type="file",
                 why="delete skipped because unlink failed",
                 observed_epoch=candidate.mtime,
-                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+                details=_audit_details(errno=getattr(exc, "errno", ""), error=str(exc)),
             )
             continue
 
         deleted += 1
         deleted_bytes += max(0, candidate.size_bytes)
-        deleted_records.append((candidate.path, candidate.mtime))
+        deleted_records.append(
+            DeletedFileRecord(
+                path=candidate.path,
+                observed_epoch=candidate.mtime,
+                size_bytes=candidate.size_bytes,
+            )
+        )
 
     return FileDeleteResult(
         deleted=deleted,
         deleted_bytes=deleted_bytes,
         deleted_records=tuple(deleted_records),
-        skipped_records=tuple(skipped_records),
+        skipped_records=skipped_records,
     )
 
 
-def _delete_directories(paths: list[str], *, report_root: str) -> DirDeleteResult:
-    """Delete empty directories after revalidating each path safely.
+def _delete_directories(
+    candidates: list[DirCandidate],
+    *,
+    report_root: str,
+    audit_limit: int,
+) -> DirDeleteResult:
+    """Delete empty directories after revalidating each candidate safely.
 
-    The function deletes only real directories. It does not rely on
-    ``Path.exists()`` because that follows symlinks. Every candidate is
-    revalidated with ``follow_symlinks=False`` immediately before ``rmdir()``.
-    Non-existing paths, non-directories, symlinks, and non-empty directories are
-    skipped.
+    The function deletes only real directories whose current filesystem identity
+    still matches the identity collected during empty-directory evaluation.
 
-    Only real directories are removed. Symlinks, missing paths, non-directories,
-    unreadable paths, non-empty directories, and failed removals are skipped and
+    It does not rely on ``Path.exists()`` because that follows symlinks. Every
+    candidate is revalidated with ``follow_symlinks=False`` immediately before
+    ``rmdir()``.
+
+    Missing paths, unreadable paths, non-directories, changed/recreated
+    directories, non-empty directories, and failed removals are skipped and
     captured as structured delete-phase audit records.
     """
 
     deleted = 0
-    deleted_records: list[tuple[str, float]] = []
-    skipped_records: list[AuditRecord] = []
+    deleted_records: list[DeletedDirectoryRecord] = []
+    skipped_records: AuditBuckets = _new_audit_buckets()
 
-    for path_str in _sort_directories_deepest_first(paths):
-        path = Path(path_str)
+    for candidate in sorted(
+        candidates,
+        key=lambda item: _directory_path_sort_key(item.path),
+    ):
+        path = Path(candidate.path)
 
         try:
             path_stat = path.stat(follow_symlinks=False)
         except FileNotFoundError:
-            _append_audit_record(
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
-                path=path_str,
+                path=candidate.path,
                 item_type="directory",
                 why="delete skipped because directory disappeared before deletion",
             )
             continue
         except OSError as exc:
-            LOGGER.warning("Skipping directory deletion candidate with unreadable metadata: %s: %s", path, exc)
-            _append_audit_record(
+            LOGGER.warning(
+                "Skipping directory deletion candidate with unreadable metadata: %s: %s",
+                path,
+                exc,
+            )
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
-                path=path_str,
+                path=candidate.path,
                 item_type="directory",
                 why="delete skipped because directory metadata became unreadable",
-                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+                details=_audit_details(errno=getattr(exc, "errno", ""), error=str(exc)),
             )
             continue
 
         if not stat.S_ISDIR(path_stat.st_mode):
-            LOGGER.warning("Skipping directory deletion candidate because it is not a real directory: %s", path)
-            _append_audit_record(
+            LOGGER.warning(
+                "Skipping directory deletion candidate because it is not a real directory: %s",
+                path,
+            )
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
-                path=path_str,
+                path=candidate.path,
                 item_type="entry",
                 why="delete skipped because candidate is no longer a real directory",
                 observed_epoch=float(path_stat.st_mtime),
-                detail=f"mode={oct(stat.S_IMODE(path_stat.st_mode))}",
+                details=_audit_details(mode=oct(stat.S_IMODE(path_stat.st_mode))),
             )
             continue
 
         observed_epoch = float(path_stat.st_mtime)
 
+        current_identity = (
+            int(path_stat.st_dev),
+            int(path_stat.st_ino),
+        )
+        expected_identity = (
+            candidate.device,
+            candidate.inode,
+        )
+
+        if current_identity != expected_identity:
+            LOGGER.warning(
+                "Skipping directory deletion candidate because it was replaced after collection: %s",
+                path,
+            )
+            _add_audit_record(
+                skipped_records,
+                audit_limit=audit_limit,
+                cleanup_root=report_root,
+                path=candidate.path,
+                item_type="directory",
+                why="delete skipped because directory was replaced after collection",
+                observed_epoch=observed_epoch,
+                details=_audit_details(
+                    scan_device=candidate.device,
+                    scan_inode=candidate.inode,
+                    current_device=int(path_stat.st_dev),
+                    current_inode=int(path_stat.st_ino),
+                    current_mtime_ns=int(path_stat.st_mtime_ns),
+                ),
+            )
+            continue
+
         try:
             path.rmdir()
         except FileNotFoundError:
-            _append_audit_record(
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
-                path=path_str,
+                path=candidate.path,
                 item_type="directory",
                 why="delete skipped because directory disappeared before rmdir",
                 observed_epoch=observed_epoch,
             )
             continue
         except NotADirectoryError:
-            LOGGER.warning("Skipping directory deletion candidate because it stopped being a directory: %s", path)
-            _append_audit_record(
+            LOGGER.warning(
+                "Skipping directory deletion candidate because it stopped being a directory: %s",
+                path,
+            )
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
-                path=path_str,
+                path=candidate.path,
                 item_type="entry",
                 why="delete skipped because candidate stopped being a directory",
                 observed_epoch=observed_epoch,
@@ -1487,36 +1774,47 @@ def _delete_directories(paths: list[str], *, report_root: str) -> DirDeleteResul
             continue
         except OSError as exc:
             if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
-                _append_audit_record(
+                _add_audit_record(
                     skipped_records,
+                    audit_limit=audit_limit,
                     cleanup_root=report_root,
-                    path=path_str,
+                    path=candidate.path,
                     item_type="directory",
                     why="delete skipped because directory was not empty at rmdir time",
                     observed_epoch=observed_epoch,
-                    detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+                    details=_audit_details(errno=getattr(exc, "errno", ""), error=str(exc)),
                 )
                 continue
 
-            LOGGER.warning("Failed deleting empty directory candidate: %s: %s", path, exc)
-            _append_audit_record(
+            LOGGER.warning(
+                "Failed deleting empty directory candidate: %s: %s",
+                path,
+                exc,
+            )
+            _add_audit_record(
                 skipped_records,
+                audit_limit=audit_limit,
                 cleanup_root=report_root,
-                path=path_str,
+                path=candidate.path,
                 item_type="directory",
                 why="delete skipped because rmdir failed",
                 observed_epoch=observed_epoch,
-                detail=f"errno={getattr(exc, 'errno', '')}; error={exc}",
+                details=_audit_details(errno=getattr(exc, "errno", ""), error=str(exc)),
             )
             continue
 
         deleted += 1
-        deleted_records.append((path_str, observed_epoch))
+        deleted_records.append(
+            DeletedDirectoryRecord(
+                path=candidate.path,
+                observed_epoch=observed_epoch,
+            )
+        )
 
     return DirDeleteResult(
         deleted=deleted,
         deleted_records=tuple(deleted_records),
-        skipped_records=tuple(skipped_records),
+        skipped_records=skipped_records,
     )
 
 
@@ -1536,7 +1834,16 @@ def _remove_lock(lock_file: Path) -> None:
     try:
         lock_file.unlink(missing_ok=True)
     except OSError as exc:
-        _log_warning_table("99", "Lock Cleanup Warning", ["Field", "Value"], [["lock_file", str(lock_file)], ["error", str(exc)]])
+        _log_table(
+            level=logging.WARNING,
+            number="99",
+            title="Lock Cleanup Warning",
+            headers=["Field", "Value"],
+            rows=[
+                ["lock_file", str(lock_file)],
+                ["error", str(exc)],
+            ],
+        )
 
 
 def _switch_rows(settings: CleanupSettings) -> list[list[Any]]:
@@ -1544,9 +1851,10 @@ def _switch_rows(settings: CleanupSettings) -> list[list[Any]]:
         [10, "LOGGING__BASE_LOG_FOLDER", "airflow.cfg", settings.base_log_folder, "Single validated cleanup root"],
         [20, "TARGET_DENY_LIST", "Airflow Variable", settings.target_deny_list, "Optional protected top-level targets"],
         [30, "MAX_LOG_AGE_DAYS", "Airflow Variable", settings.max_log_age_days, "Retention threshold in full days for file eligibility"],
-        [40, "DRY_RUN", "DAG Param", settings.dry_run, "If true, candidates are reported but nothing is deleted"],
-        [50, "DELETE_ENABLED", "Code constant", settings.delete_enabled, "Global code-side delete capability switch"],
-        [60, "LOCK_FILE_PATH", "Code constant", settings.lock_file_path, "Shared worker lock used to prevent concurrent cleanup collisions"],
+        [40, "DELETE_LOG_CAP", "Airflow Variable", settings.delete_log_cap, "Maximum rendered audit sample items per reason group in dry-run and delete mode"],
+        [50, "DRY_RUN", "DAG Param", settings.dry_run, "If true, candidates are reported but nothing is deleted"],
+        [60, "DELETE_ENABLED", "Code constant", settings.delete_enabled, "Global code-side delete capability switch"],
+        [70, "LOCK_FILE_PATH", "Code constant", settings.lock_file_path, "Shared worker lock used to prevent concurrent cleanup collisions"],
     ]
 
 
@@ -1557,8 +1865,9 @@ def _evaluated_state_rows(settings: CleanupSettings) -> list[list[Any]]:
         [30, "TARGET_DENY_LIST_INVALID", "parsed", settings.invalid_target_deny_list, "Ignored because names are not safe top-level folder names"],
         [40, "EVALUATED_EXCLUDED_TARGETS", "evaluated", [target.label for target in settings.excluded_targets], "Resolved targets excluded by TARGET_DENY_LIST (symlink, non-directory, and unreadable entries)"],
         [50, "MAX_LOG_AGE_DAYS", "evaluated", settings.max_log_age_days, "Retention threshold in full days"],
-        [60, "DRY_RUN", "evaluated", settings.dry_run, "Report candidates without deleting"],
-        [70, "EFFECTIVE_DELETE_MODE", "evaluated", settings.effective_delete_mode, "Final execution mode after dry-run and code-side delete switch"],
+        [60, "DELETE_LOG_CAP", "evaluated", settings.delete_log_cap, "Maximum rendered audit sample items per reason group in dry-run and delete mode"],
+        [70, "DRY_RUN", "evaluated", settings.dry_run, "Report candidates without deleting"],
+        [80, "EFFECTIVE_DELETE_MODE", "evaluated", settings.effective_delete_mode, "Final execution mode after dry-run and code-side delete switch"],
     ]
 
 
@@ -1591,6 +1900,66 @@ def _action_audit_title(settings: CleanupSettings) -> str:
     return "Deleted Items" if settings.effective_delete_mode == "delete" else "Candidate Items"
 
 
+def _append_action_audit_records(
+    records: AuditBuckets,
+    *,
+    settings: CleanupSettings,
+    scan_result: ScanResult,
+    empty_dir_result: EmptyDirCollectResult,
+    deleted_files: FileDeleteResult,
+    deleted_dirs: DirDeleteResult,
+) -> None:
+    audit_limit = max(1, settings.delete_log_cap)
+
+    if settings.effective_delete_mode == "delete":
+        for record in deleted_files.deleted_records:
+            _add_audit_record(
+                records,
+                audit_limit=audit_limit,
+                cleanup_root=settings.base_log_folder,
+                path=record.path,
+                item_type="file",
+                why=f"deleted because regular file age exceeded {settings.max_log_age_days}d",
+                observed_epoch=record.observed_epoch,
+                details=_audit_details(size_bytes=record.size_bytes),
+            )
+
+        for record in deleted_dirs.deleted_records:
+            _add_audit_record(
+                records,
+                audit_limit=audit_limit,
+                cleanup_root=settings.base_log_folder,
+                path=record.path,
+                item_type="directory",
+                why="deleted because directory was empty during cleanup phase",
+                observed_epoch=record.observed_epoch,
+            )
+
+        return
+
+    for candidate in scan_result.old_files:
+        _add_audit_record(
+            records,
+            audit_limit=audit_limit,
+            cleanup_root=settings.base_log_folder,
+            path=candidate.path,
+            item_type="file",
+            why=f"would delete because regular file age exceeded {settings.max_log_age_days}d",
+            observed_epoch=float(candidate.mtime),
+            details=_audit_details(size_bytes=candidate.size_bytes),
+        )
+
+    for candidate in empty_dir_result.empty_directories:
+        _add_audit_record(
+            records,
+            audit_limit=audit_limit,
+            cleanup_root=settings.base_log_folder,
+            path=candidate.path,
+            item_type="directory",
+            why="would delete because directory would be empty during cleanup phase",
+        )
+
+
 def _action_outcome_rows(
     settings: CleanupSettings,
     totals: RunTotals,
@@ -1608,62 +1977,63 @@ def _action_outcome_rows(
     ]
 
 
+OVERALL_OUTCOME_FIELDS: tuple[tuple[str, str, bool], ...] = (
+    ("roots_processed", "roots_processed", False),
+    ("directories_visited", "directories_visited", False),
+    ("directory_entries_seen", "directory_entries_seen", False),
+    ("file_entries_seen", "file_entries_seen", False),
+    ("files_scanned_regular", "files_scanned_regular", False),
+    ("regular_file_total_size", "regular_file_total_size_bytes", True),
+    ("old_file_candidates", "old_file_candidates", False),
+    ("old_file_candidate_total_size", "candidate_file_total_size_bytes", True),
+    ("empty_dir_candidates", "empty_dir_candidates", False),
+    ("files_deleted", "files_deleted", False),
+    ("files_deleted_total_size", "files_deleted_bytes", True),
+    ("empty_dirs_deleted", "empty_dirs_deleted", False),
+    ("duration_seconds", "duration_seconds", False),
+)
+
+
 def _overall_outcome_rows(totals: RunTotals) -> list[tuple[str, Any]]:
-    return [
-        ("status", "completed"),
-        ("roots_processed", totals.roots_processed),
-        ("directories_visited", totals.directories_visited),
-        ("directory_entries_seen", totals.directory_entries_seen),
-        ("file_entries_seen", totals.file_entries_seen),
-        ("files_scanned_regular", totals.files_scanned_regular),
-        ("regular_file_total_size", _human_bytes(totals.regular_file_total_size_bytes)),
-        ("old_file_candidates", totals.old_file_candidates),
-        ("old_file_candidate_total_size", _human_bytes(totals.candidate_file_total_size_bytes)),
-        ("empty_dir_candidates", totals.empty_dir_candidates),
-        ("files_deleted", totals.files_deleted),
-        ("files_deleted_total_size", _human_bytes(totals.files_deleted_bytes)),
-        ("empty_dirs_deleted", totals.empty_dirs_deleted),
-        ("duration_seconds", totals.duration_seconds),
-    ]
+    rows: list[tuple[str, Any]] = [("status", "completed")]
+
+    for label, attr_name, render_bytes in OVERALL_OUTCOME_FIELDS:
+        value = getattr(totals, attr_name)
+        rows.append((label, _human_bytes(value) if render_bytes else value))
+
+    return rows
 
 
-def _locked_result(duration_seconds: float) -> dict[str, Any]:
-    return {
-        "status": "skipped_locked",
-        "roots_processed": 0,
-        "directories_visited": 0,
-        "directory_entries_seen": 0,
-        "file_entries_seen": 0,
-        "files_scanned_regular": 0,
-        "regular_file_total_size_bytes": 0,
-        "candidate_file_total_size_bytes": 0,
-        "old_file_candidates": 0,
-        "empty_dir_candidates": 0,
-        "files_deleted": 0,
-        "files_deleted_bytes": 0,
-        "empty_dirs_deleted": 0,
+def _result_dict(
+    *,
+    status: str,
+    totals: RunTotals | None = None,
+    duration_seconds: float,
+    action_skipped_count: int | None = None,
+) -> dict[str, Any]:
+    source = totals or RunTotals()
+
+    result: dict[str, Any] = {
+        "status": status,
+        "roots_processed": source.roots_processed,
+        "directories_visited": source.directories_visited,
+        "directory_entries_seen": source.directory_entries_seen,
+        "file_entries_seen": source.file_entries_seen,
+        "files_scanned_regular": source.files_scanned_regular,
+        "regular_file_total_size_bytes": source.regular_file_total_size_bytes,
+        "candidate_file_total_size_bytes": source.candidate_file_total_size_bytes,
+        "old_file_candidates": source.old_file_candidates,
+        "empty_dir_candidates": source.empty_dir_candidates,
+        "files_deleted": source.files_deleted,
+        "files_deleted_bytes": source.files_deleted_bytes,
+        "empty_dirs_deleted": source.empty_dirs_deleted,
         "duration_seconds": duration_seconds,
     }
 
+    if action_skipped_count is not None:
+        result["action_skipped_items"] = action_skipped_count
 
-def _completed_result(totals: RunTotals, *, action_skipped_count: int) -> dict[str, Any]:
-    return {
-        "status": "completed",
-        "roots_processed": totals.roots_processed,
-        "directories_visited": totals.directories_visited,
-        "directory_entries_seen": totals.directory_entries_seen,
-        "file_entries_seen": totals.file_entries_seen,
-        "files_scanned_regular": totals.files_scanned_regular,
-        "regular_file_total_size_bytes": totals.regular_file_total_size_bytes,
-        "candidate_file_total_size_bytes": totals.candidate_file_total_size_bytes,
-        "old_file_candidates": totals.old_file_candidates,
-        "empty_dir_candidates": totals.empty_dir_candidates,
-        "files_deleted": totals.files_deleted,
-        "files_deleted_bytes": totals.files_deleted_bytes,
-        "empty_dirs_deleted": totals.empty_dirs_deleted,
-        "duration_seconds": totals.duration_seconds,
-        "action_skipped_items": action_skipped_count,
-    }
+    return result
 
 
 with DAG(
@@ -1676,19 +2046,26 @@ with DAG(
         "owner": DAG_OWNER_NAME,
         "depends_on_past": False,
         "email": ALERT_EMAIL_ADDRESSES,
-        "email_on_failure": True,
+        "email_on_failure": bool(ALERT_EMAIL_ADDRESSES),
         "email_on_retry": False,
         "retries": 1,
         "retry_delay": timedelta(minutes=1),
     },
-    params={"dry_run": False},
+    params={"dry_run": Param(False, type="boolean")},
     tags=TAGS,
     doc_md=__doc__,
 ) as dag:
 
-    @task(pool="default_pool", pool_slots=1)
+    @task(
+        pool="default_pool",
+        pool_slots=1,
+        execution_timeout=TASK_EXECUTION_TIMEOUT,
+    )
     def execute_cleanup() -> dict[str, Any]:
-        settings = _build_settings(get_current_context().get("params") or {})
+        context = get_current_context()
+        evaluation_epoch = _resolve_evaluation_epoch(context)
+        settings = _build_settings(context["params"])
+
         task_started = time.monotonic()
 
         _log_section(
@@ -1696,33 +2073,90 @@ with DAG(
             "Execution Context",
             [
                 ("MAX_LOG_AGE_DAYS", settings.max_log_age_days),
+                ("DELETE_LOG_CAP", settings.delete_log_cap),
                 ("DRY_RUN", settings.dry_run),
                 ("DELETE_ENABLED", settings.delete_enabled),
                 ("EFFECTIVE_DELETE_MODE", settings.effective_delete_mode),
                 ("LOCK_FILE_PATH", settings.lock_file_path),
+                ("EVALUATION_EPOCH", round(evaluation_epoch, 3)),
             ],
         )
-        _log_info_table("01", "Configurable switches", ["Priority", "SwitchOrParameter", "SourceType", "CurrentValue", "Purpose"], _switch_rows(settings))
-        _log_info_table("02", "Evaluated State", ["Priority", "State", "Source", "Value", "Meaning"], _evaluated_state_rows(settings))
-        _log_info_table("04", "Deletion Scope and Exclusions", ["Priority", "Area", "Subject", "Explanation"], _deletion_scope_rows(settings.max_log_age_days, dry_run=settings.dry_run))
+        _log_table(
+            level=logging.INFO,
+            number="01",
+            title="Configurable switches",
+            headers=[
+                "Priority",
+                "SwitchOrParameter",
+                "SourceType",
+                "CurrentValue",
+                "Purpose",
+            ],
+            rows=_switch_rows(settings),
+        )
+        _log_table(
+            level=logging.INFO,
+            number="02",
+            title="Evaluated State",
+            headers=["Priority", "State", "Source", "Value", "Meaning"],
+            rows=_evaluated_state_rows(settings),
+        )
+        _log_table(
+            level=logging.INFO,
+            number="04",
+            title="Deletion Scope and Exclusions",
+            headers=["Priority", "Area", "Subject", "Explanation"],
+            rows=_deletion_scope_rows(settings.max_log_age_days, dry_run=settings.dry_run),
+        )
 
         lock_file = Path(settings.lock_file_path)
         if not _try_create_lock(lock_file):
-            result = _locked_result(round(time.monotonic() - task_started, 3))
-            _log_section("07", "Overall Outcome", [("status", result["status"]), ("roots_processed", result["roots_processed"]), ("duration_seconds", result["duration_seconds"])])
-            _log_audit_list("10", "Action Skipped Items", [])
-            _log_audit_list("11", "Excluded Items", [])
-            _log_audit_list("12", _action_audit_title(settings), [])
+            result = _result_dict(
+                status="skipped_locked",
+                duration_seconds=round(time.monotonic() - task_started, 3),
+            )
+            _log_section(
+                "07",
+                "Overall Outcome",
+                [
+                    ("status", result["status"]),
+                    ("roots_processed", result["roots_processed"]),
+                    ("duration_seconds", result["duration_seconds"]),
+                ],
+            )
+            _log_audit_list(
+                "10",
+                "Action Skipped Items",
+                _new_audit_buckets(),
+                evaluation_epoch=evaluation_epoch,
+                delete_log_cap=settings.delete_log_cap,
+            )
+            _log_audit_list(
+                "11",
+                "Excluded Items",
+                _new_audit_buckets(),
+                evaluation_epoch=evaluation_epoch,
+                delete_log_cap=settings.delete_log_cap,
+            )
+            _log_audit_list(
+                "12",
+                _action_audit_title(settings),
+                _new_audit_buckets(),
+                evaluation_epoch=evaluation_epoch,
+                delete_log_cap=settings.delete_log_cap,
+            )
             return result
 
         totals = RunTotals()
-        action_audit_records: list[AuditRecord] = []
-        action_skipped_audit_records: list[AuditRecord] = []
-        excluded_audit_records: list[AuditRecord] = []
+        action_audit_records: AuditBuckets = _new_audit_buckets()
+        action_skipped_audit_records: AuditBuckets = _new_audit_buckets()
+        excluded_audit_records: AuditBuckets = _new_audit_buckets()
+        audit_limit = max(1, settings.delete_log_cap)
 
         for target in settings.excluded_targets:
-            _append_audit_record(
+            _add_audit_record(
                 excluded_audit_records,
+                audit_limit=audit_limit,
                 cleanup_root=settings.base_log_folder,
                 path=target.path,
                 item_type=target.item_type,
@@ -1733,93 +2167,157 @@ with DAG(
             for target in settings.included_targets:
                 cleanup_root = Path(target.path)
 
-                scan_result = _scan_cleanup_target(
-                    cleanup_root,
-                    max_age_days=settings.max_log_age_days,
-                    report_root=settings.base_log_folder,
+                try:
+                    scan_result = _scan_cleanup_target(
+                        cleanup_root,
+                        max_age_days=settings.max_log_age_days,
+                        report_root=settings.base_log_folder,
+                        evaluation_epoch=evaluation_epoch,
+                        audit_limit=audit_limit,
+                    )
+                except RuntimeError as exc:
+                    _add_audit_record(
+                        excluded_audit_records,
+                        audit_limit=audit_limit,
+                        cleanup_root=settings.base_log_folder,
+                        path=target.path,
+                        item_type="directory",
+                        why="target skipped because target root became unavailable during scan",
+                        details=_audit_details(
+                            exception_type=type(exc).__name__,
+                            error=str(exc),
+                        ),
+                    )
+                    continue
+
+                deleted_files = FileDeleteResult()
+                deleted_dirs = DirDeleteResult()
+
+                try:
+                    if settings.effective_delete_mode != "delete":
+                        empty_dir_result = _collect_empty_directories(
+                            cleanup_root,
+                            report_root=settings.base_log_folder,
+                            audit_limit=audit_limit,
+                            ignored_regular_files={candidate.path for candidate in scan_result.old_files},
+                        )
+                    else:
+                        deleted_files = _delete_files(
+                            scan_result.old_files,
+                            report_root=settings.base_log_folder,
+                            audit_limit=audit_limit,
+                        )
+
+                        empty_dir_result = _collect_empty_directories(
+                            cleanup_root,
+                            report_root=settings.base_log_folder,
+                            audit_limit=audit_limit,
+                        )
+                        deleted_dirs = _delete_directories(
+                            empty_dir_result.empty_directories,
+                            report_root=settings.base_log_folder,
+                            audit_limit=audit_limit,
+                        )
+                except RuntimeError as exc:
+                    empty_dir_result = EmptyDirCollectResult()
+                    _add_audit_record(
+                        excluded_audit_records,
+                        audit_limit=audit_limit,
+                        cleanup_root=settings.base_log_folder,
+                        path=target.path,
+                        item_type="directory",
+                        why="target skipped because target root became unavailable during empty-directory evaluation",
+                        details=_audit_details(
+                            exception_type=type(exc).__name__,
+                            error=str(exc),
+                        ),
+                    )
+
+                totals.add_scan(
+                    scan_result.stats,
+                    old_file_candidates=len(scan_result.old_files),
+                    empty_dir_candidates=len(empty_dir_result.empty_directories),
                 )
-                if settings.dry_run or not settings.delete_enabled:
-                    deleted_files = FileDeleteResult()
-                    empty_dir_result = _collect_empty_directories(
-                        cleanup_root,
-                        report_root=settings.base_log_folder,
-                        ignored_regular_files={candidate.path for candidate in scan_result.old_files},
-                    )
-                    deleted_dirs = DirDeleteResult()
-                else:
-                    deleted_files = _delete_files(
-                        scan_result.old_files,
-                        report_root=settings.base_log_folder,
-                    )
-
-                    empty_dir_result = _collect_empty_directories(
-                        cleanup_root,
-                        report_root=settings.base_log_folder,
-                    )
-                    deleted_dirs = _delete_directories(
-                        empty_dir_result.empty_directories,
-                        report_root=settings.base_log_folder,
-                    )
-
-                totals.add_scan(scan_result.stats, old_file_candidates=len(scan_result.old_files), empty_dir_candidates=len(empty_dir_result.empty_directories))
-                totals.add_action(files_deleted=deleted_files.deleted, files_deleted_bytes=deleted_files.deleted_bytes, empty_dirs_deleted=deleted_dirs.deleted)
-
-                excluded_audit_records.extend(scan_result.excluded_records)
-                action_skipped_audit_records.extend(deleted_files.skipped_records)
-                action_skipped_audit_records.extend(deleted_dirs.skipped_records)
-                excluded_audit_records.extend(empty_dir_result.excluded_records)
-
-                if settings.effective_delete_mode == "delete":
-                    for path_str, observed_epoch in deleted_files.deleted_records:
-                        _append_audit_record(
-                            action_audit_records,
-                            cleanup_root=settings.base_log_folder,
-                            path=path_str,
-                            item_type="file",
-                            why=f"deleted because regular file age exceeded {settings.max_log_age_days}d",
-                            observed_epoch=float(observed_epoch),
-                        )
-
-                    for path_str, observed_epoch in deleted_dirs.deleted_records:
-                        _append_audit_record(
-                            action_audit_records,
-                            cleanup_root=settings.base_log_folder,
-                            path=path_str,
-                            item_type="directory",
-                            why="deleted because directory was empty during cleanup phase",
-                            observed_epoch=float(observed_epoch),
-                        )
-                else:
-                    for candidate in scan_result.old_files:
-                        _append_audit_record(
-                            action_audit_records,
-                            cleanup_root=settings.base_log_folder,
-                            path=candidate.path,
-                            item_type="file",
-                            why=f"would delete because regular file age exceeded {settings.max_log_age_days}d",
-                            observed_epoch=float(candidate.mtime),
-                            detail=f"size_bytes={candidate.size_bytes}",
-                        )
-
-                    for path_str in empty_dir_result.empty_directories:
-                        _append_audit_record(
-                            action_audit_records,
-                            cleanup_root=settings.base_log_folder,
-                            path=path_str,
-                            item_type="directory",
-                            why="would delete because directory would be empty during cleanup phase",
-                        )
+                totals.add_action(
+                    files_deleted=deleted_files.deleted,
+                    files_deleted_bytes=deleted_files.deleted_bytes,
+                    empty_dirs_deleted=deleted_dirs.deleted,
+                )
+                _merge_audit_buckets(
+                    excluded_audit_records,
+                    scan_result.excluded_records,
+                    audit_limit=audit_limit,
+                )
+                _merge_audit_buckets(
+                    excluded_audit_records,
+                    empty_dir_result.excluded_records,
+                    audit_limit=audit_limit,
+                )
+                _merge_audit_buckets(
+                    action_skipped_audit_records,
+                    deleted_files.skipped_records,
+                    audit_limit=audit_limit,
+                )
+                _merge_audit_buckets(
+                    action_skipped_audit_records,
+                    deleted_dirs.skipped_records,
+                    audit_limit=audit_limit,
+                )
+                _append_action_audit_records(
+                    action_audit_records,
+                    settings=settings,
+                    scan_result=scan_result,
+                    empty_dir_result=empty_dir_result,
+                    deleted_files=deleted_files,
+                    deleted_dirs=deleted_dirs,
+                )
 
             totals.duration_seconds = round(time.monotonic() - task_started, 3)
-            _log_info_table("05", "Root Scan Summary", ["SummaryItem", "Value", "Decision", "EvaluationMethod"], _root_scan_summary_rows(totals))
-            _log_section("06", "Action Outcome Summary", _action_outcome_rows(settings, totals, action_skipped_count=len(action_skipped_audit_records)))
+
+            _log_table(
+                level=logging.INFO,
+                number="05",
+                title="Root Scan Summary",
+                headers=["SummaryItem", "Value", "Decision", "EvaluationMethod"],
+                rows=_root_scan_summary_rows(totals),
+            )
+            _log_section(
+                "06",
+                "Action Outcome Summary",
+                _action_outcome_rows(
+                    settings,
+                    totals,
+                    action_skipped_count=_audit_total(action_skipped_audit_records),
+                ),
+            )
             _log_section("07", "Overall Outcome", _overall_outcome_rows(totals))
-            _log_audit_list("10", "Action Skipped Items", action_skipped_audit_records)
-            _log_audit_list("11", "Excluded Items", excluded_audit_records)
-            _log_audit_list("12", _action_audit_title(settings), action_audit_records)
-            return _completed_result(
-                totals,
-                action_skipped_count=len(action_skipped_audit_records),
+            _log_audit_list(
+                "10",
+                "Action Skipped Items",
+                action_skipped_audit_records,
+                evaluation_epoch=evaluation_epoch,
+                delete_log_cap=settings.delete_log_cap,
+            )
+            _log_audit_list(
+                "11",
+                "Excluded Items",
+                excluded_audit_records,
+                evaluation_epoch=evaluation_epoch,
+                delete_log_cap=settings.delete_log_cap,
+            )
+            _log_audit_list(
+                "12",
+                _action_audit_title(settings),
+                action_audit_records,
+                evaluation_epoch=evaluation_epoch,
+                delete_log_cap=settings.delete_log_cap,
+            )
+
+            return _result_dict(
+                status="completed",
+                totals=totals,
+                duration_seconds=totals.duration_seconds,
+                action_skipped_count=_audit_total(action_skipped_audit_records),
             )
         finally:
             _remove_lock(lock_file)
