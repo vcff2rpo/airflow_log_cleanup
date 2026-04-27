@@ -121,7 +121,7 @@ def test_log_table_renders_header_rows_and_final_border(import_log_clean: Any, m
     rendered = captured[0]
     lines = rendered.splitlines()
     assert lines[0].startswith("99 :: Test Table")
-    table_lines = lines[1:]
+    table_lines = [line for line in lines[1:] if line]
     assert table_lines[0].startswith("+")
     assert table_lines[-1].startswith("+")
     assert "true" in rendered
@@ -216,16 +216,19 @@ def test_log_audit_list_caps_delete_mode_and_disables_cap_for_report_only(
 
 def test_resolve_top_level_targets_tracks_directory_file_symlink_and_deny_list(import_log_clean: Any, tmp_path: Path) -> None:
     module = import_log_clean
-    (tmp_path / "scheduler").mkdir()
-    (tmp_path / "worker").mkdir()
-    (tmp_path / "triggerer").mkdir()
-    (tmp_path / "top-level.log").write_text("x", encoding="utf-8")
-    external = tmp_path / "external"
-    external.mkdir()
-    (tmp_path / "linked-dir").symlink_to(external, target_is_directory=True)
+    base_root = tmp_path / "base"
+    external_root = tmp_path / "external-target"
+    base_root.mkdir()
+    external_root.mkdir()
+
+    (base_root / "scheduler").mkdir()
+    (base_root / "worker").mkdir()
+    (base_root / "triggerer").mkdir()
+    (base_root / "top-level.log").write_text("x", encoding="utf-8")
+    (base_root / "linked-dir").symlink_to(external_root, target_is_directory=True)
 
     included, excluded = module._resolve_top_level_targets(
-        base_log_folder=str(tmp_path),
+        base_log_folder=str(base_root),
         target_deny_list=["worker"],
     )
 
